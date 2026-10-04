@@ -13,3 +13,6 @@ run: compile
 
 build:
 	mkdir -p build
+
+format:
+	clang-format -i *.c *.h

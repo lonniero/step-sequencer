@@ -1,16 +1,16 @@
-#define RAYGUI_IMPLEMENTATION 
+#define RAYGUI_IMPLEMENTATION
 
+#include "raylib.h"
+#include <portmidi.h>
+#include <porttime.h>
+#include <pthread.h>
+#include <raygui.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <raygui.h>
-#include <pthread.h>
-#include <porttime.h>
-#include <portmidi.h>
-#include "raylib.h"
 
 #define CLOCK_RESOLUTION_MS 1
-#define NOTE_ON       144
-#define NOTE_OFF      128
+#define NOTE_ON             144
+#define NOTE_OFF            128
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 double bpm = 120.0; // guarded by lock
@@ -36,6 +36,35 @@ send_midi_note_off (PmStream *stream, uint8_t note) {
   Pm_WriteShort(stream, 0, note_on_event.message);
 }
 
+typedef struct MidiOutputDevice {
+  int id;
+  char *name;
+} MidiOutputDevice;
+
+MidiOutputDevice *midi_output_devices;
+
+int midi_output_count = 0;
+char midi_output_labels[1024];
+
+int32_t
+list_midi_devices (void) {
+  int32_t num_devices = Pm_CountDevices();
+  midi_output_devices = malloc(sizeof(MidiOutputDevice) * num_devices);
+  midi_output_count = 0;
+  strlcat(midi_output_labels, "No Output;", sizeof midi_output_labels);
+  for (int32_t i = 0; i < num_devices; ++i) {
+    const PmDeviceInfo *info = Pm_GetDeviceInfo(i);
+    if (info->output) {
+      midi_output_devices[midi_output_count].id = i;
+      midi_output_devices[midi_output_count].name = (char *) info->name;
+      if (midi_output_count > 0) strlcat(midi_output_labels, ";", sizeof midi_output_labels);
+      strlcat(midi_output_labels, info->name, sizeof midi_output_labels);
+      midi_output_count++;
+    }
+  }
+  return midi_output_count;
+}
+
 typedef struct Loop {
   double loop_start;
 } Loop;
@@ -51,31 +80,36 @@ typedef struct Track {
 Loop loop;
 Track tracks[tracks_length];
 
-uint64_t rand_u64 (void) {
+uint64_t
+rand_u64 (void) {
   uint64_t r;
   arc4random_buf(&r, sizeof r);
   return r;
 }
 
-bool bit_by_position (uint64_t num, int bit_position) {
-  uint64_t mask = (uint64_t)1 << bit_position;
+bool
+bit_by_position (uint64_t num, int bit_position) {
+  uint64_t mask = (uint64_t) 1 << bit_position;
   return (num & mask) >> bit_position;
 }
 
-void randomize_tracks_seqs (void) {
+void
+randomize_tracks_seqs (void) {
   for (size_t i = 0; i < tracks_length; i++) {
     tracks[i].sequence = rand_u64();
   }
 }
 
-void init_tracks (void) {
+void
+init_tracks (void) {
   for (size_t i = 0; i < tracks_length; i++) {
     tracks[i].steps = 8;
     tracks[i].midi_note = 40 + i;
   }
 }
 
-void run_step (Track *track) {
+void
+run_step (Track *track) {
   if (track->playing) {
     send_midi_note_off(midi_output_stream, track->midi_note);
     track->playing = false;
@@ -87,14 +121,16 @@ void run_step (Track *track) {
   track->current_step++;
 }
 
-void sync_tracks (void) {
+void
+sync_tracks (void) {
   for (size_t i = 0; i < tracks_length; i++) {
     tracks[i].current_step = 0;
     run_step(&tracks[i]);
   }
 }
 
-double loop_length_ms (void) {
+double
+loop_length_ms (void) {
   return beats_per_loop * 60000.0 / bpm;
 }
 
@@ -121,7 +157,8 @@ tick (PtTimestamp now, void *user_data) {
   pthread_mutex_unlock(&lock);
 }
 
-void stop_sequencer (void) {
+void
+stop_sequencer (void) {
   pthread_mutex_lock(&lock);
   running = false;
   for (size_t i = 0; i < tracks_length; i++) {
@@ -135,27 +172,22 @@ void stop_sequencer (void) {
 
 int32_t
 init_midi_output_stream (PmDeviceID output_device_id) {
-  PmError result;
-  result = Pm_Initialize();
-  if (result != pmNoError) {
-    printf("PortMidi initialization failed: %s\n", Pm_GetErrorText(result));
-    return 1;
-  }
-  result = Pm_OpenOutput(&midi_output_stream, output_device_id, NULL, 512, NULL, NULL, 0);
+  PmError result = Pm_OpenOutput(&midi_output_stream, output_device_id, NULL, 512, NULL, NULL, 0);
   if (result != pmNoError) {
     printf("Failed to open MIDI output device: %s\n", Pm_GetErrorText(result));
     return 1;
   }
-
   return 0;
 }
 
-int main(void) {
+int
+main (void) {
   InitWindow(400, 200, "raygui - controls test suite");
   SetTargetFPS(60);
+  Pm_Initialize();
 
-  init_midi_output_stream(1); // hardcoded jsut to test
   init_tracks();
+  list_midi_devices();
   randomize_tracks_seqs();
 
   if (Pt_Start(CLOCK_RESOLUTION_MS, tick, NULL) != ptNoError) {
@@ -163,9 +195,22 @@ int main(void) {
     return 1;
   }
 
+  int dropdownBoxActive = 0;
+  bool dropDownEditMode = false;
+
   while (!WindowShouldClose()) {
     BeginDrawing();
     ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
+
+    if (GuiDropdownBox((Rectangle){25, 65 + 20, 125, 30}, midi_output_labels, &dropdownBoxActive, dropDownEditMode)) {
+      dropDownEditMode = !dropDownEditMode;
+      pthread_mutex_lock(&lock);
+      if (dropdownBoxActive > 0) {
+        init_midi_output_stream(midi_output_devices[dropdownBoxActive].id);
+      }
+      pthread_mutex_unlock(&lock);
+    }
+
     EndDrawing();
   }
 
