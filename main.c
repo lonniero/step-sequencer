@@ -5,12 +5,36 @@
 #include <raygui.h>
 #include <pthread.h>
 #include <porttime.h>
+#include <portmidi.h>
 #include "raylib.h"
 
 #define CLOCK_RESOLUTION_MS 1
+#define NOTE_ON       144
+#define NOTE_OFF      128
+
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-int loop_ms = 10000;
+double bpm = 120.0; // guarded by lock
+const int beats_per_loop = 4;
 const int tracks_length = 8;
+bool running = true; // guarded by lock; once false, tick never touches MIDI again
+
+PmStream *midi_output_stream;
+
+void
+send_midi_note_on (PmStream *stream, uint8_t note) {
+  PmEvent note_on_event;
+  note_on_event.message = Pm_Message(NOTE_ON, note, 127);
+  note_on_event.timestamp = 0;
+  Pm_WriteShort(stream, 0, note_on_event.message);
+}
+
+void
+send_midi_note_off (PmStream *stream, uint8_t note) {
+  PmEvent note_on_event;
+  note_on_event.message = Pm_Message(NOTE_OFF, note, 0);
+  note_on_event.timestamp = 0;
+  Pm_WriteShort(stream, 0, note_on_event.message);
+}
 
 typedef struct Loop {
   double loop_start;
@@ -47,16 +71,17 @@ void randomize_tracks_seqs (void) {
 void init_tracks (void) {
   for (size_t i = 0; i < tracks_length; i++) {
     tracks[i].steps = 8;
+    tracks[i].midi_note = 40 + i;
   }
 }
 
 void run_step (Track *track) {
   if (track->playing) {
-    // send midi off
+    send_midi_note_off(midi_output_stream, track->midi_note);
     track->playing = false;
   }
   if (bit_by_position(track->sequence, track->current_step)) {
-    // send midi on
+    send_midi_note_on(midi_output_stream, track->midi_note);
     track->playing = true;
   }
   track->current_step++;
@@ -69,30 +94,67 @@ void sync_tracks (void) {
   }
 }
 
+double loop_length_ms (void) {
+  return beats_per_loop * 60000.0 / bpm;
+}
+
 static void
 tick (PtTimestamp now, void *user_data) {
   pthread_mutex_lock(&lock);
-  double elapsed = now - loop.loop_start;
-  if (elapsed >= loop_ms) {
-    loop.loop_start += loop_ms;
-    sync_tracks();
-  } else {
-    for (size_t i = 0; i < tracks_length; i++) {
-      double step_length = loop_ms / (double) tracks[i].steps;
-      int loop_current_step = elapsed / step_length;
-      if (tracks[i].current_step <= loop_current_step) {
-        tracks[i].current_step = loop_current_step;
-        run_step(&tracks[i]);
+  if (running) {
+    double loop_ms = loop_length_ms();
+    double elapsed = now - loop.loop_start;
+    if (elapsed >= loop_ms) {
+      loop.loop_start += loop_ms;
+      sync_tracks();
+    } else {
+      for (size_t i = 0; i < tracks_length; i++) {
+        double step_length = loop_ms / (double) tracks[i].steps;
+        int loop_current_step = elapsed / step_length;
+        if (tracks[i].current_step <= loop_current_step) {
+          tracks[i].current_step = loop_current_step;
+          run_step(&tracks[i]);
+        }
       }
     }
   }
   pthread_mutex_unlock(&lock);
 }
 
+void stop_sequencer (void) {
+  pthread_mutex_lock(&lock);
+  running = false;
+  for (size_t i = 0; i < tracks_length; i++) {
+    if (tracks[i].playing) {
+      send_midi_note_off(midi_output_stream, tracks[i].midi_note);
+      tracks[i].playing = false;
+    }
+  }
+  pthread_mutex_unlock(&lock);
+}
+
+int32_t
+init_midi_output_stream (PmDeviceID output_device_id) {
+  PmError result;
+  result = Pm_Initialize();
+  if (result != pmNoError) {
+    printf("PortMidi initialization failed: %s\n", Pm_GetErrorText(result));
+    return 1;
+  }
+  result = Pm_OpenOutput(&midi_output_stream, output_device_id, NULL, 512, NULL, NULL, 0);
+  if (result != pmNoError) {
+    printf("Failed to open MIDI output device: %s\n", Pm_GetErrorText(result));
+    return 1;
+  }
+
+  return 0;
+}
+
 int main(void) {
   InitWindow(400, 200, "raygui - controls test suite");
   SetTargetFPS(60);
 
+  init_midi_output_stream(1); // hardcoded jsut to test
   init_tracks();
   randomize_tracks_seqs();
 
@@ -107,7 +169,10 @@ int main(void) {
     EndDrawing();
   }
 
+  stop_sequencer();
   Pt_Stop();
+  Pm_Close(midi_output_stream);
+  Pm_Terminate();
   CloseWindow();
   return 0;
 }
