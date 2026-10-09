@@ -7,6 +7,7 @@
 #include <raygui.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define CLOCK_RESOLUTION_MS 1
 #define NOTE_ON             144
@@ -18,7 +19,7 @@ const int beats_per_loop = 4;
 const int tracks_length = 8;
 bool running = true; // guarded by lock; once false, tick never touches MIDI again
 
-PmStream *midi_output_stream;
+PmStream *midi_output_stream = NULL;
 
 void
 send_midi_note_on (PmStream *stream, uint8_t note) {
@@ -180,6 +181,24 @@ init_midi_output_stream (PmDeviceID output_device_id) {
   return 0;
 }
 
+int32_t
+close_midi_output_stream (void) {
+  if (!midi_output_stream) return 0;
+  for (size_t i = 0; i < tracks_length; i++) {
+    if (tracks[i].playing) {
+      send_midi_note_off(midi_output_stream, tracks[i].midi_note);
+      tracks[i].playing = false;
+    }
+  }
+  PmError result = Pm_Close(midi_output_stream);
+  midi_output_stream = NULL;
+  if (result != pmNoError) {
+    printf("Failed to close MIDI output device: %s\n", Pm_GetErrorText(result));
+    return 1;
+  }
+  return 0;
+}
+
 int
 main (void) {
   InitWindow(400, 200, "raygui - controls test suite");
@@ -205,8 +224,9 @@ main (void) {
     if (GuiDropdownBox((Rectangle){25, 65 + 20, 125, 30}, midi_output_labels, &dropdownBoxActive, dropDownEditMode)) {
       dropDownEditMode = !dropDownEditMode;
       pthread_mutex_lock(&lock);
+      close_midi_output_stream();
       if (dropdownBoxActive > 0) {
-        init_midi_output_stream(midi_output_devices[dropdownBoxActive].id);
+        init_midi_output_stream(midi_output_devices[dropdownBoxActive - 1].id);
       }
       pthread_mutex_unlock(&lock);
     }
@@ -216,7 +236,7 @@ main (void) {
 
   stop_sequencer();
   Pt_Stop();
-  Pm_Close(midi_output_stream);
+  close_midi_output_stream();
   Pm_Terminate();
   CloseWindow();
   return 0;
