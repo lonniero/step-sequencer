@@ -48,8 +48,8 @@ jobs:
         if: env.NOTARIZE == 'true'
         run: |
           codesign --force --timestamp --options runtime \
-            --sign "Developer ID Application" build/midi
-          codesign --verify --strict --verbose=2 build/midi
+            --sign "Developer ID Application" build/step-sequencer
+          codesign --verify --strict --verbose=2 build/step-sequencer
 
       - name: Notarize
         if: env.NOTARIZE == 'true'
@@ -58,8 +58,8 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
-          ditto -c -k --keepParent build/midi build/midi.zip
-          xcrun notarytool submit build/midi.zip \
+          ditto -c -k --keepParent build/step-sequencer build/step-sequencer.zip
+          xcrun notarytool submit build/step-sequencer.zip \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_PASSWORD" \
@@ -69,8 +69,8 @@ jobs:
         if: env.NOTARIZE == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: midi-macos
-          path: build/midi.zip
+          name: step-sequencer-macos
+          path: build/step-sequencer.zip
 
       - name: Remove keychain
         if: always() && env.NOTARIZE == 'true'

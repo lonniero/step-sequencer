@@ -2,6 +2,7 @@ RAYLIB := $(shell brew --prefix raylib)
 PORTMIDI := $(shell brew --prefix portmidi)
 
 SRC := main.c midi.c
+BIN := build/step-sequencer
 
 DEPS := $(abspath build/deps)
 DEPLOYMENT_TARGET := 14.0
@@ -9,12 +10,12 @@ RAYLIB_VERSION := 6.0
 PORTMIDI_VERSION := v2.0.7
 
 compile: | build
-	gcc -Wall -Werror -Wpedantic -o build/midi $(SRC) -isystem . \
+	gcc -Wall -Werror -Wpedantic -o $(BIN) $(SRC) -isystem . \
 		-I$(RAYLIB)/include -L$(RAYLIB)/lib -lraylib \
 		-I$(PORTMIDI)/include -L$(PORTMIDI)/lib -lportmidi -lpthread
 
 release: deps | build
-	gcc -Wall -Werror -Wpedantic -O2 -mmacosx-version-min=$(DEPLOYMENT_TARGET) -o build/midi $(SRC) -isystem . \
+	gcc -Wall -Werror -Wpedantic -O2 -mmacosx-version-min=$(DEPLOYMENT_TARGET) -o $(BIN) $(SRC) -isystem . \
 		-I$(DEPS)/include $(DEPS)/lib/libraylib.a $(DEPS)/lib/libportmidi.a \
 		-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL \
 		-framework CoreMIDI -framework CoreAudio -framework CoreFoundation -framework CoreServices \
@@ -39,7 +40,7 @@ $(DEPS)/lib/libportmidi.a:
 	cmake --build build/src/portmidi/build --target install
 
 run: compile
-	./build/midi
+	./$(BIN)
 
 build:
 	mkdir -p build
