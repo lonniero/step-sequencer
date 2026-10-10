@@ -1,5 +1,9 @@
 # step-sequencer
 
+<img width="1596" height="934" alt="image" src="https://github.com/user-attachments/assets/5907d515-de7e-496f-a1eb-25e019975253" />
+
+---
+
 An 8-track MIDI step sequencer for macOS, written in C with [raylib](https://www.raylib.com/), [raygui](https://github.com/raysan5/raygui) and [PortMidi](https://github.com/PortMidi/portmidi).
 
 - 8 tracks, each with its own MIDI note and step count (1–32), so tracks of different lengths play polyrhythms
