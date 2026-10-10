@@ -12,6 +12,31 @@
 
 #define CLOCK_RESOLUTION_MS 1
 #define TRACKS_LENGTH       8
+#define MAX_STEPS           32
+#define MIN_BPM             40
+#define MAX_BPM             240
+
+#define WINDOW_WIDTH  800
+#define WINDOW_HEIGHT 470
+#define MARGIN        20
+#define HEADER_HEIGHT 36
+#define TOOLBAR_Y     52
+#define LABELS_Y      98
+#define GRID_X        330
+#define GRID_Y        120
+#define GRID_WIDTH    450
+#define GRID_GAP      2
+#define ROW_HEIGHT    38
+#define CELL_HEIGHT   28
+#define FOOTER_Y      436
+
+#define PAPER      (Color){232, 230, 223, 255}
+#define PAPER_DARK (Color){214, 211, 202, 255}
+#define INK        (Color){21, 21, 21, 255}
+#define INK_LIGHT  (Color){58, 58, 58, 255}
+#define MUTED      (Color){140, 138, 132, 255}
+#define RULE       (Color){201, 198, 188, 255}
+#define ACCENT     (Color){206, 112, 78, 255}
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -34,8 +59,8 @@ bool running = true; // guarded by lock; once false, tick never touches MIDI aga
 Loop loop;
 Track tracks[TRACKS_LENGTH];
 
-int dropdownBoxActive = 0;
-bool dropDownEditMode = false;
+int dropdown_active = 0;
+bool dropdown_edit_mode = false;
 
 uint64_t
 rand_u64 (void) {
@@ -50,17 +75,29 @@ bit_by_position (uint64_t num, int bit_position) {
   return (num & mask) >> bit_position;
 }
 
+uint64_t
+steps_mask (unsigned int steps) {
+  return ((uint64_t) 1 << steps) - 1;
+}
+
 void
 randomize_tracks_seqs (void) {
   for (size_t i = 0; i < TRACKS_LENGTH; i++) {
-    tracks[i].sequence = rand_u64();
+    tracks[i].sequence = rand_u64() & steps_mask(tracks[i].steps);
+  }
+}
+
+void
+clear_tracks_seqs (void) {
+  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
+    tracks[i].sequence = 0;
   }
 }
 
 void
 init_tracks (void) {
   for (size_t i = 0; i < TRACKS_LENGTH; i++) {
-    tracks[i].steps = 8;
+    tracks[i].steps = 16;
     tracks[i].midi_note = 40 + i;
   }
 }
@@ -89,6 +126,31 @@ sync_tracks (void) {
 double
 loop_length_ms (void) {
   return beats_per_loop * 60000.0 / bpm;
+}
+
+void
+set_bpm (double new_bpm) {
+  double now = Pt_Time();
+  double phase = (now - loop.loop_start) / loop_length_ms();
+  bpm = new_bpm;
+  loop.loop_start = now - phase * loop_length_ms();
+}
+
+void
+set_track_steps (Track *track, unsigned int steps) {
+  double step_length = loop_length_ms() / steps;
+  unsigned int step = (Pt_Time() - loop.loop_start) / step_length;
+  track->steps = steps;
+  track->current_step = step + 1;
+}
+
+void
+set_track_note (Track *track, unsigned int note) {
+  if (track->playing) {
+    send_midi_note_off(midi_output_stream, track->midi_note);
+    track->playing = false;
+  }
+  track->midi_note = note;
 }
 
 static void
@@ -156,35 +218,150 @@ close_midi_output_stream (void) {
 }
 
 void
+select_midi_output (int index) {
+  close_midi_output_stream();
+  if (index > 0) init_midi_output_stream(midi_output_devices[index - 1].id);
+}
+
+const char *
+note_name (unsigned int note) {
+  static const char *names[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+  return TextFormat("%s%d", names[note % 12], (int) note / 12 - 1);
+}
+
+void
+setup_style (void) {
+  GuiSetStyle(DEFAULT, BACKGROUND_COLOR, ColorToInt(PAPER));
+  GuiSetStyle(DEFAULT, LINE_COLOR, ColorToInt(INK));
+  GuiSetStyle(DEFAULT, TEXT_SIZE, 10);
+  GuiSetStyle(DEFAULT, TEXT_SPACING, 1);
+  GuiSetStyle(DEFAULT, BORDER_WIDTH, 1);
+
+  GuiSetStyle(DEFAULT, BORDER_COLOR_NORMAL, ColorToInt(INK));
+  GuiSetStyle(DEFAULT, BASE_COLOR_NORMAL, ColorToInt(PAPER));
+  GuiSetStyle(DEFAULT, TEXT_COLOR_NORMAL, ColorToInt(INK));
+  GuiSetStyle(DEFAULT, BORDER_COLOR_FOCUSED, ColorToInt(INK));
+  GuiSetStyle(DEFAULT, BASE_COLOR_FOCUSED, ColorToInt(PAPER_DARK));
+  GuiSetStyle(DEFAULT, TEXT_COLOR_FOCUSED, ColorToInt(INK));
+  GuiSetStyle(DEFAULT, BORDER_COLOR_PRESSED, ColorToInt(INK));
+  GuiSetStyle(DEFAULT, BASE_COLOR_PRESSED, ColorToInt(INK));
+  GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED, ColorToInt(PAPER));
+  GuiSetStyle(DEFAULT, BORDER_COLOR_DISABLED, ColorToInt(MUTED));
+  GuiSetStyle(DEFAULT, BASE_COLOR_DISABLED, ColorToInt(PAPER));
+  GuiSetStyle(DEFAULT, TEXT_COLOR_DISABLED, ColorToInt(MUTED));
+
+  GuiSetStyle(LABEL, TEXT_COLOR_FOCUSED, ColorToInt(INK));
+  GuiSetStyle(LABEL, TEXT_COLOR_PRESSED, ColorToInt(INK));
+
+  GuiSetStyle(BUTTON, BASE_COLOR_FOCUSED, ColorToInt(INK));
+  GuiSetStyle(BUTTON, TEXT_COLOR_FOCUSED, ColorToInt(PAPER));
+  GuiSetStyle(BUTTON, BASE_COLOR_PRESSED, ColorToInt(ACCENT));
+  GuiSetStyle(BUTTON, BORDER_COLOR_PRESSED, ColorToInt(ACCENT));
+  GuiSetStyle(BUTTON, TEXT_COLOR_PRESSED, ColorToInt(INK));
+
+  GuiSetStyle(SLIDER, BASE_COLOR_PRESSED, ColorToInt(ACCENT));
+  GuiSetStyle(SLIDER, TEXT_COLOR_FOCUSED, ColorToInt(ACCENT));
+  GuiSetStyle(SLIDER, TEXT_COLOR_PRESSED, ColorToInt(ACCENT));
+  GuiSetStyle(SLIDER, SLIDER_PADDING, 3);
+
+  GuiSetStyle(DROPDOWNBOX, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+  GuiSetStyle(DROPDOWNBOX, TEXT_PADDING, 8);
+}
+
+void
 render_dropdown (void) {
-  if (GuiDropdownBox((Rectangle){20, 20, 125, 30}, midi_output_labels, &dropdownBoxActive, dropDownEditMode)) {
-    dropDownEditMode = !dropDownEditMode;
-    close_midi_output_stream();
-    if (dropdownBoxActive > 0) {
-      init_midi_output_stream(midi_output_devices[dropdownBoxActive - 1].id);
-    }
+  int previous = dropdown_active;
+  if (GuiDropdownBox((Rectangle){MARGIN, TOOLBAR_Y, 260, CELL_HEIGHT}, midi_output_labels, &dropdown_active, dropdown_edit_mode)) {
+    dropdown_edit_mode = !dropdown_edit_mode;
+  }
+  if (dropdown_active != previous) select_midi_output(dropdown_active);
+}
+
+void
+render_header (void) {
+  DrawRectangle(0, 0, WINDOW_WIDTH, HEADER_HEIGHT, INK);
+  DrawText("SEQ/08", MARGIN, 8, 20, PAPER);
+  DrawText("STEP SEQUENCER / MIDI OUT", 110, 14, 10, MUTED);
+
+  double phase = (Pt_Time() - loop.loop_start) / loop_length_ms();
+  int beat = phase * beats_per_loop;
+  for (int k = 0; k < beats_per_loop; k++) {
+    int x = WINDOW_WIDTH - MARGIN - 8 - (beats_per_loop - 1 - k) * 14;
+    DrawRectangle(x, 14, 8, 8, k == beat ? ACCENT : INK_LIGHT);
   }
 }
 
 void
-render_grid (void) {
-  for (int i = 0; i < TRACKS_LENGTH; i++) {
-    for (int j = 0; j < tracks[i].steps; j++) {
-      bool on = bit_by_position(tracks[i].sequence, j);
-      int x0 = 50 + (j * 160) / tracks[i].steps;
-      int x1 = 50 + ((j + 1) * 160) / tracks[i].steps;
-      Rectangle r = {x0, 50 + i * 20, x1 - x0, 20};
-      if (GuiToggle(r, NULL, &on)) {
-        tracks[i].sequence ^= (uint64_t) 1 << j; // flip bit 0
-      }
-    }
+render_toolbar (void) {
+  float bpm_value = bpm;
+  GuiSliderBar((Rectangle){GRID_X, TOOLBAR_Y, 200, CELL_HEIGHT}, "BPM", TextFormat("%03d", (int) bpm), &bpm_value, MIN_BPM, MAX_BPM);
+  if ((int) bpm_value != (int) bpm) set_bpm((int) bpm_value);
+
+  if (GuiButton((Rectangle){600, TOOLBAR_Y, 85, CELL_HEIGHT}, "RANDOMIZE")) randomize_tracks_seqs();
+  if (GuiButton((Rectangle){695, TOOLBAR_Y, 85, CELL_HEIGHT}, "CLEAR")) clear_tracks_seqs();
+}
+
+void
+render_track (Track *track, int index) {
+  float y = GRID_Y + index * ROW_HEIGHT;
+
+  DrawText(TextFormat("%02d", index + 1), MARGIN, y + 4, 20, INK);
+  DrawText(note_name(track->midi_note), 52, y + 9, 10, MUTED);
+
+  int note = track->midi_note;
+  GuiSpinner((Rectangle){90, y, 100, CELL_HEIGHT}, NULL, &note, 0, 127, false);
+  if (note != (int) track->midi_note) set_track_note(track, note);
+
+  int steps = track->steps;
+  GuiSpinner((Rectangle){200, y, 100, CELL_HEIGHT}, NULL, &steps, 1, MAX_STEPS, false);
+  if (steps != (int) track->steps) set_track_steps(track, steps);
+
+  unsigned int playing_step = (track->current_step + track->steps - 1) % track->steps;
+  for (unsigned int j = 0; j < track->steps; j++) {
+    int x0 = GRID_X + (j * GRID_WIDTH) / track->steps;
+    int x1 = GRID_X + ((j + 1) * GRID_WIDTH) / track->steps;
+    Rectangle cell = {x0, y, x1 - x0 - GRID_GAP, CELL_HEIGHT};
+
+    bool on = bit_by_position(track->sequence, j);
+    if (GuiToggle(cell, NULL, &on)) track->sequence ^= (uint64_t) 1 << j;
+
+    if (j == playing_step) DrawRectangleRec(cell, on ? ACCENT : Fade(ACCENT, 0.25f));
   }
+
+  if (index < TRACKS_LENGTH - 1) DrawRectangle(MARGIN, y + ROW_HEIGHT - 5, WINDOW_WIDTH - 2 * MARGIN, 1, RULE);
+}
+
+void
+render_tracks (void) {
+  DrawText("NO", MARGIN, LABELS_Y, 10, MUTED);
+  DrawText("NOTE", 90, LABELS_Y, 10, MUTED);
+  DrawText("STEPS", 200, LABELS_Y, 10, MUTED);
+  for (int k = 0; k < beats_per_loop; k++) {
+    DrawText(TextFormat("%d", k + 1), GRID_X + k * GRID_WIDTH / beats_per_loop, LABELS_Y, 10, MUTED);
+  }
+  DrawRectangle(MARGIN, GRID_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, INK);
+
+  for (int i = 0; i < TRACKS_LENGTH; i++) {
+    render_track(&tracks[i], i);
+  }
+}
+
+void
+render_footer (void) {
+  const char *output = dropdown_active > 0 ? midi_output_devices[dropdown_active - 1].name : "NONE";
+  const char *info = TextFormat("%d/4  %.0f MS / LOOP", beats_per_loop, loop_length_ms());
+
+  DrawRectangle(MARGIN, FOOTER_Y, WINDOW_WIDTH - 2 * MARGIN, 1, INK);
+  DrawRectangle(MARGIN, FOOTER_Y + 11, 6, 6, midi_output_stream ? ACCENT : MUTED);
+  DrawText(TextFormat("OUT  %s", TextToUpper(output)), MARGIN + 12, FOOTER_Y + 10, 10, INK);
+  DrawText(info, WINDOW_WIDTH - MARGIN - MeasureText(info, 10), FOOTER_Y + 10, 10, MUTED);
 }
 
 int
 main (void) {
-  InitWindow(800, 600, "raygui - controls test suite");
+  InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "SEQ/08");
   SetTargetFPS(60);
+  setup_style();
   Pm_Initialize();
 
   init_tracks();
@@ -198,11 +375,16 @@ main (void) {
 
   while (!WindowShouldClose()) {
     BeginDrawing();
-    ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
+    ClearBackground(PAPER);
 
     pthread_mutex_lock(&lock);
 
-    render_grid();
+    render_header();
+    render_footer();
+    if (dropdown_edit_mode) GuiLock();
+    render_toolbar();
+    render_tracks();
+    GuiUnlock();
     render_dropdown();
 
     pthread_mutex_unlock(&lock);
