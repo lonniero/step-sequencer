@@ -201,7 +201,7 @@ close_midi_output_stream (void) {
 
 int
 main (void) {
-  InitWindow(400, 200, "raygui - controls test suite");
+  InitWindow(800, 600, "raygui - controls test suite");
   SetTargetFPS(60);
   Pm_Initialize();
 
@@ -221,15 +221,29 @@ main (void) {
     BeginDrawing();
     ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
 
-    if (GuiDropdownBox((Rectangle){25, 65 + 20, 125, 30}, midi_output_labels, &dropdownBoxActive, dropDownEditMode)) {
+    pthread_mutex_lock(&lock);
+
+    for (int i = 0; i < tracks_length; i++) {
+      for (int j = 0; j < tracks[i].steps; j++) {
+        bool on = bit_by_position(tracks[i].sequence, j);
+        int x0 = 50 + (j * 160) / tracks[i].steps;
+        int x1 = 50 + ((j + 1) * 160) / tracks[i].steps;
+        Rectangle r = {x0, 50 + i * 20, x1 - x0, 20};
+        if (GuiToggle(r, NULL, &on)) {
+          tracks[i].sequence ^= (uint64_t) 1 << j; // flip bit 0
+        }
+      }
+    }
+
+    if (GuiDropdownBox((Rectangle){20, 20, 125, 30}, midi_output_labels, &dropdownBoxActive, dropDownEditMode)) {
       dropDownEditMode = !dropDownEditMode;
-      pthread_mutex_lock(&lock);
       close_midi_output_stream();
       if (dropdownBoxActive > 0) {
         init_midi_output_stream(midi_output_devices[dropdownBoxActive - 1].id);
       }
-      pthread_mutex_unlock(&lock);
     }
+
+    pthread_mutex_unlock(&lock);
 
     EndDrawing();
   }
