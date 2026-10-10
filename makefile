@@ -1,7 +1,7 @@
 RAYLIB := $(shell brew --prefix raylib)
 PORTMIDI := $(shell brew --prefix portmidi)
 
-SRC := main.c
+SRC := main.c midi.c
 
 compile: | build
 	gcc -Wall -Werror -Wpedantic -o build/midi $(SRC) -isystem . \
