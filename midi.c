@@ -1,5 +1,8 @@
 #include "midi.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 PmStream *midi_output_stream;
 MidiOutputDevice *midi_output_devices;
 

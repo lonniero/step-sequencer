@@ -1,8 +1,7 @@
 #pragma once
 
 #include <portmidi.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stdint.h>
 
 #define NOTE_ON  144
 #define NOTE_OFF 128

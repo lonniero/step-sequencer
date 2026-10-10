@@ -4,17 +4,16 @@
 #include <pthread.h>
 #include <raygui.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "midi.h"
 #include "raylib.h"
 
 #define CLOCK_RESOLUTION_MS 1
+#define TRACKS_LENGTH       8
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-double bpm = 120.0; // guarded by lock
-const int beats_per_loop = 4;
-const int tracks_length = 8;
-bool running = true; // guarded by lock; once false, tick never touches MIDI again
 
 typedef struct Loop {
   double loop_start;
@@ -28,8 +27,15 @@ typedef struct Track {
   bool playing;
 } Track;
 
+double bpm = 120.0; // guarded by lock
+const int beats_per_loop = 4;
+bool running = true; // guarded by lock; once false, tick never touches MIDI again
+
 Loop loop;
-Track tracks[tracks_length];
+Track tracks[TRACKS_LENGTH];
+
+int dropdownBoxActive = 0;
+bool dropDownEditMode = false;
 
 uint64_t
 rand_u64 (void) {
@@ -46,14 +52,14 @@ bit_by_position (uint64_t num, int bit_position) {
 
 void
 randomize_tracks_seqs (void) {
-  for (size_t i = 0; i < tracks_length; i++) {
+  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
     tracks[i].sequence = rand_u64();
   }
 }
 
 void
 init_tracks (void) {
-  for (size_t i = 0; i < tracks_length; i++) {
+  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
     tracks[i].steps = 8;
     tracks[i].midi_note = 40 + i;
   }
@@ -74,7 +80,7 @@ run_step (Track *track) {
 
 void
 sync_tracks (void) {
-  for (size_t i = 0; i < tracks_length; i++) {
+  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
     tracks[i].current_step = 0;
     run_step(&tracks[i]);
   }
@@ -95,7 +101,7 @@ tick (PtTimestamp now, void *user_data) {
       loop.loop_start += loop_ms;
       sync_tracks();
     } else {
-      for (size_t i = 0; i < tracks_length; i++) {
+      for (size_t i = 0; i < TRACKS_LENGTH; i++) {
         double step_length = loop_ms / (double) tracks[i].steps;
         int loop_current_step = elapsed / step_length;
         if (tracks[i].current_step <= loop_current_step) {
@@ -112,7 +118,7 @@ void
 stop_sequencer (void) {
   pthread_mutex_lock(&lock);
   running = false;
-  for (size_t i = 0; i < tracks_length; i++) {
+  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
     if (tracks[i].playing) {
       send_midi_note_off(midi_output_stream, tracks[i].midi_note);
       tracks[i].playing = false;
@@ -134,7 +140,7 @@ init_midi_output_stream (PmDeviceID output_device_id) {
 int32_t
 close_midi_output_stream (void) {
   if (!midi_output_stream) return 0;
-  for (size_t i = 0; i < tracks_length; i++) {
+  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
     if (tracks[i].playing) {
       send_midi_note_off(midi_output_stream, tracks[i].midi_note);
       tracks[i].playing = false;
@@ -147,6 +153,32 @@ close_midi_output_stream (void) {
     return 1;
   }
   return 0;
+}
+
+void
+render_dropdown (void) {
+  if (GuiDropdownBox((Rectangle){20, 20, 125, 30}, midi_output_labels, &dropdownBoxActive, dropDownEditMode)) {
+    dropDownEditMode = !dropDownEditMode;
+    close_midi_output_stream();
+    if (dropdownBoxActive > 0) {
+      init_midi_output_stream(midi_output_devices[dropdownBoxActive - 1].id);
+    }
+  }
+}
+
+void
+render_grid (void) {
+  for (int i = 0; i < TRACKS_LENGTH; i++) {
+    for (int j = 0; j < tracks[i].steps; j++) {
+      bool on = bit_by_position(tracks[i].sequence, j);
+      int x0 = 50 + (j * 160) / tracks[i].steps;
+      int x1 = 50 + ((j + 1) * 160) / tracks[i].steps;
+      Rectangle r = {x0, 50 + i * 20, x1 - x0, 20};
+      if (GuiToggle(r, NULL, &on)) {
+        tracks[i].sequence ^= (uint64_t) 1 << j; // flip bit 0
+      }
+    }
+  }
 }
 
 int
@@ -164,34 +196,14 @@ main (void) {
     return 1;
   }
 
-  int dropdownBoxActive = 0;
-  bool dropDownEditMode = false;
-
   while (!WindowShouldClose()) {
     BeginDrawing();
     ClearBackground(GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));
 
     pthread_mutex_lock(&lock);
 
-    for (int i = 0; i < tracks_length; i++) {
-      for (int j = 0; j < tracks[i].steps; j++) {
-        bool on = bit_by_position(tracks[i].sequence, j);
-        int x0 = 50 + (j * 160) / tracks[i].steps;
-        int x1 = 50 + ((j + 1) * 160) / tracks[i].steps;
-        Rectangle r = {x0, 50 + i * 20, x1 - x0, 20};
-        if (GuiToggle(r, NULL, &on)) {
-          tracks[i].sequence ^= (uint64_t) 1 << j; // flip bit 0
-        }
-      }
-    }
-
-    if (GuiDropdownBox((Rectangle){20, 20, 125, 30}, midi_output_labels, &dropdownBoxActive, dropDownEditMode)) {
-      dropDownEditMode = !dropDownEditMode;
-      close_midi_output_stream();
-      if (dropdownBoxActive > 0) {
-        init_midi_output_stream(midi_output_devices[dropdownBoxActive - 1].id);
-      }
-    }
+    render_grid();
+    render_dropdown();
 
     pthread_mutex_unlock(&lock);
 
