@@ -3,10 +3,13 @@ name: build
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
+    env:
+      NOTARIZE: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -17,7 +20,7 @@ jobs:
         run: make compile
 
       - name: Import signing certificate
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: env.NOTARIZE == 'true'
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -39,7 +42,7 @@ jobs:
           rm "$RUNNER_TEMP/certificate.p12"
 
       - name: Sign
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: env.NOTARIZE == 'true'
         run: |
           codesign --force --timestamp --options runtime \
             --entitlements entitlements.plist \
@@ -47,7 +50,7 @@ jobs:
           codesign --verify --strict --verbose=2 build/midi
 
       - name: Notarize
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: env.NOTARIZE == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -61,12 +64,12 @@ jobs:
             --wait
 
       - name: Upload notarized build
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: env.NOTARIZE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: midi-macos
           path: build/midi.zip
 
       - name: Remove keychain
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: always() && env.NOTARIZE == 'true'
         run: security delete-keychain "$RUNNER_TEMP/build.keychain-db" || true
