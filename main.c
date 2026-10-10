@@ -280,8 +280,6 @@ render_dropdown (void) {
 void
 render_header (void) {
   DrawRectangle(0, 0, WINDOW_WIDTH, HEADER_HEIGHT, INK);
-  DrawText("SEQ/08", MARGIN, 8, 20, PAPER);
-  DrawText("STEP SEQUENCER / MIDI OUT", 110, 14, 10, MUTED);
 
   double phase = (Pt_Time() - loop.loop_start) / loop_length_ms();
   int beat = phase * beats_per_loop;
