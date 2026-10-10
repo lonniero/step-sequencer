@@ -13,11 +13,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: brew install raylib portmidi
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/deps
+          key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('makefile') }}
 
       - name: Build
-        run: make compile
+        run: make release
 
       - name: Import signing certificate
         if: env.NOTARIZE == 'true'
@@ -45,7 +48,6 @@ jobs:
         if: env.NOTARIZE == 'true'
         run: |
           codesign --force --timestamp --options runtime \
-            --entitlements entitlements.plist \
             --sign "Developer ID Application" build/midi
           codesign --verify --strict --verbose=2 build/midi
 
