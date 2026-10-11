@@ -358,7 +358,7 @@ render_track (Track *track) {
 void
 render_step (void) {
   Step *step = &steps[selected_step];
-  Track *track = &tracks[selected_step / MAX_STEPS];
+  const Track *track = &tracks[selected_step / MAX_STEPS];
 
   DrawText("STEP", MARGIN, STEP_LABELS_Y, 10, MUTED);
   DrawText("DETUNE", 90, STEP_LABELS_Y, 10, MUTED);
