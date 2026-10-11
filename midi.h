@@ -15,7 +15,7 @@ extern PmStream *midi_output_stream;
 extern MidiOutputDevice *midi_output_devices;
 
 extern int midi_output_count;
-extern char midi_output_labels[1024];
+extern char *midi_output_labels;
 
 void
 send_midi_note_on (PmStream *stream, uint8_t note);
