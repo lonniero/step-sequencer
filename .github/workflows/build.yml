@@ -20,7 +20,7 @@ jobs:
           key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('makefile') }}
 
       - name: Build
-        run: make release
+        run: make app
 
       - name: Import signing certificate
         if: env.NOTARIZE == 'true'
@@ -48,8 +48,8 @@ jobs:
         if: env.NOTARIZE == 'true'
         run: |
           codesign --force --timestamp --options runtime \
-            --sign "Developer ID Application" build/step-sequencer
-          codesign --verify --strict --verbose=2 build/step-sequencer
+            --sign "Developer ID Application" build/StepSequencer.app
+          codesign --verify --strict --verbose=2 build/StepSequencer.app
 
       - name: Notarize
         if: env.NOTARIZE == 'true'
@@ -58,19 +58,22 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
-          ditto -c -k --keepParent build/step-sequencer build/step-sequencer.zip
-          xcrun notarytool submit build/step-sequencer.zip \
+          ditto -c -k --keepParent build/StepSequencer.app build/StepSequencer.zip
+          xcrun notarytool submit build/StepSequencer.zip \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_PASSWORD" \
             --wait
+          xcrun stapler staple build/StepSequencer.app
+          rm build/StepSequencer.zip
+          ditto -c -k --keepParent build/StepSequencer.app build/StepSequencer.zip
 
       - name: Upload notarized build
         if: env.NOTARIZE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: step-sequencer-macos
-          path: build/step-sequencer.zip
+          path: build/StepSequencer.zip
 
       - name: Remove keychain
         if: always() && env.NOTARIZE == 'true'

@@ -24,6 +24,8 @@ make run
 
 The binary is written to `build/step-sequencer`.
 
+`make app` packages the release binary as `build/StepSequencer.app`, with the icon generated from `icon.png`.
+
 ## Sending MIDI to another app
 
 To play the sequencer through a DAW or soft synth on the same Mac, use the built-in IAC Driver:

@@ -3,6 +3,7 @@ PORTMIDI := $(shell brew --prefix portmidi)
 
 SRC := main.c midi.c
 BIN := build/step-sequencer
+APP := build/StepSequencer.app
 
 DEPS := $(abspath build/deps)
 DEPLOYMENT_TARGET := 14.0
@@ -39,6 +40,22 @@ $(DEPS)/lib/libportmidi.a:
 		-DBUILD_SHARED_LIBS=OFF
 	cmake --build build/src/portmidi/build --target install
 
+app: release build/icon.icns
+	rm -rf $(APP)
+	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
+	cp $(BIN) $(APP)/Contents/MacOS/
+	cp Info.plist $(APP)/Contents/
+	cp build/icon.icns $(APP)/Contents/Resources/
+
+build/icon.icns: icon.png | build
+	rm -rf build/icon.iconset
+	mkdir build/icon.iconset
+	for s in 16 32 128 256 512; do \
+		sips -z $$s $$s icon.png --out build/icon.iconset/icon_$${s}x$${s}.png > /dev/null; \
+		sips -z $$((s * 2)) $$((s * 2)) icon.png --out build/icon.iconset/icon_$${s}x$${s}@2x.png > /dev/null; \
+	done
+	iconutil -c icns build/icon.iconset -o $@
+
 run: compile
 	./$(BIN)
 
@@ -48,4 +65,4 @@ build:
 format:
 	clang-format -i *.c *.h
 
-.PHONY: compile release deps run format
+.PHONY: compile release deps app run format
