@@ -18,7 +18,7 @@ extern int midi_output_count;
 extern char *midi_output_labels;
 
 void
-send_midi_note_on (PmStream *stream, uint8_t note);
+send_midi_note_on (PmStream *stream, uint8_t note, unsigned int velocity);
 
 void
 send_midi_note_off (PmStream *stream, uint8_t note);

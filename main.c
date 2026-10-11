@@ -17,7 +17,7 @@
 #define MAX_BPM             240
 
 #define WINDOW_WIDTH  800
-#define WINDOW_HEIGHT 470
+#define WINDOW_HEIGHT 520
 #define MARGIN        20
 #define HEADER_HEIGHT 36
 #define TOOLBAR_Y     52
@@ -28,7 +28,9 @@
 #define GRID_GAP      2
 #define ROW_HEIGHT    38
 #define CELL_HEIGHT   28
-#define FOOTER_Y      436
+#define STEP_LABELS_Y 428
+#define STEP_Y        450
+#define FOOTER_Y      490
 
 #define PAPER      (Color){232, 230, 223, 255}
 #define PAPER_DARK (Color){214, 211, 202, 255}
@@ -45,6 +47,7 @@ typedef struct Loop {
 } Loop;
 
 typedef struct Track {
+  unsigned int id;
   unsigned int steps;
   unsigned int midi_note;
   unsigned int current_step;
@@ -52,15 +55,23 @@ typedef struct Track {
   bool playing;
 } Track;
 
+typedef struct Step {
+  signed int detune;
+  unsigned int velocity;
+} Step;
+
 double bpm = 120.0; // guarded by lock
 const int beats_per_loop = 4;
 bool running = true; // guarded by lock; once false, tick never touches MIDI again
 
 Loop loop;
 Track tracks[TRACKS_LENGTH];
+Step steps[TRACKS_LENGTH * MAX_STEPS];
 
 int dropdown_active = 0;
 bool dropdown_edit_mode = false;
+
+int selected_step = 0;
 
 uint64_t
 rand_u64 (void) {
@@ -97,8 +108,17 @@ clear_tracks_seqs (void) {
 void
 init_tracks (void) {
   for (size_t i = 0; i < TRACKS_LENGTH; i++) {
+    tracks[i].id = i;
     tracks[i].steps = 16;
     tracks[i].midi_note = 40 + i;
+  }
+}
+
+void
+init_steps (void) {
+  for (size_t i = 0; i < TRACKS_LENGTH * MAX_STEPS; i++) {
+    steps[i].detune = 0;
+    steps[i].velocity = 100;
   }
 }
 
@@ -109,7 +129,9 @@ run_step (Track *track) {
     track->playing = false;
   }
   if (bit_by_position(track->sequence, track->current_step)) {
-    send_midi_note_on(midi_output_stream, track->midi_note);
+    signed int detune = steps[(track->id * MAX_STEPS) + track->current_step].detune;
+    unsigned int velocity = steps[(track->id * MAX_STEPS) + track->current_step].velocity;
+    send_midi_note_on(midi_output_stream, track->midi_note + detune, velocity);
     track->playing = true;
   }
   track->current_step++;
@@ -300,10 +322,10 @@ render_toolbar (void) {
 }
 
 void
-render_track (Track *track, int index) {
-  float y = GRID_Y + index * ROW_HEIGHT;
+render_track (Track *track) {
+  float y = GRID_Y + track->id * ROW_HEIGHT;
 
-  DrawText(TextFormat("%02d", index + 1), MARGIN, y + 4, 20, INK);
+  DrawText(TextFormat("%02d", track->id + 1), MARGIN, y + 4, 20, INK);
   DrawText(note_name(track->midi_note), 52, y + 9, 10, MUTED);
 
   int note = track->midi_note;
@@ -321,12 +343,38 @@ render_track (Track *track, int index) {
     Rectangle cell = {x0, y, x1 - x0 - GRID_GAP, CELL_HEIGHT};
 
     bool on = bit_by_position(track->sequence, j);
-    if (GuiToggle(cell, NULL, &on)) track->sequence ^= (uint64_t) 1 << j;
+    if (GuiToggle(cell, NULL, &on)) {
+      track->sequence ^= (uint64_t) 1 << j;
+      selected_step = (track->id * MAX_STEPS) + j;
+    }
 
     if (j == playing_step) DrawRectangleRec(cell, on ? ACCENT : Fade(ACCENT, 0.25f));
+    if (track->id * MAX_STEPS + j == (unsigned int) selected_step) DrawRectangleLinesEx(cell, 2, ACCENT);
   }
 
-  if (index < TRACKS_LENGTH - 1) DrawRectangle(MARGIN, y + ROW_HEIGHT - 5, WINDOW_WIDTH - 2 * MARGIN, 1, RULE);
+  if (track->id < TRACKS_LENGTH - 1) DrawRectangle(MARGIN, y + ROW_HEIGHT - 5, WINDOW_WIDTH - 2 * MARGIN, 1, RULE);
+}
+
+void
+render_step (void) {
+  Step *step = &steps[selected_step];
+  Track *track = &tracks[selected_step / MAX_STEPS];
+
+  DrawText("STEP", MARGIN, STEP_LABELS_Y, 10, MUTED);
+  DrawText("DETUNE", 90, STEP_LABELS_Y, 10, MUTED);
+  DrawText("VELOCITY", 200, STEP_LABELS_Y, 10, MUTED);
+  DrawRectangle(MARGIN, STEP_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, INK);
+
+  DrawText(TextFormat("%02d", selected_step % MAX_STEPS + 1), MARGIN, STEP_Y + 4, 20, INK);
+  DrawText(note_name(track->midi_note + step->detune), 52, STEP_Y + 9, 10, MUTED);
+
+  int detune = step->detune;
+  GuiSpinner((Rectangle){90, STEP_Y, 100, CELL_HEIGHT}, NULL, &detune, -36, 36, false);
+  if (detune != step->detune) step->detune = detune;
+
+  int velocity = step->velocity;
+  GuiSpinner((Rectangle){200, STEP_Y, 100, CELL_HEIGHT}, NULL, &velocity, 1, 127, false);
+  if (velocity != (int) step->velocity) step->velocity = velocity;
 }
 
 void
@@ -340,7 +388,7 @@ render_tracks (void) {
   DrawRectangle(MARGIN, GRID_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, INK);
 
   for (int i = 0; i < TRACKS_LENGTH; i++) {
-    render_track(&tracks[i], i);
+    render_track(&tracks[i]);
   }
 }
 
@@ -363,6 +411,8 @@ main (void) {
   Pm_Initialize();
 
   init_tracks();
+  init_steps();
+
   list_midi_devices();
   randomize_tracks_seqs();
 
@@ -382,6 +432,7 @@ main (void) {
     if (dropdown_edit_mode) GuiLock();
     render_toolbar();
     render_tracks();
+    render_step();
     GuiUnlock();
     render_dropdown();
 
