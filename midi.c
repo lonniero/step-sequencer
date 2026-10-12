@@ -10,17 +10,17 @@ int midi_output_count = 0;
 char *midi_output_labels;
 
 void
-send_midi_note_on (PmStream *stream, uint8_t note, unsigned int velocity) {
+send_midi_note_on (PmStream *stream, uint8_t channel, uint8_t note, unsigned int velocity) {
   PmEvent note_on_event;
-  note_on_event.message = Pm_Message(NOTE_ON, note, velocity);
+  note_on_event.message = Pm_Message(NOTE_ON | (channel & 0x0F), note, velocity);
   note_on_event.timestamp = 0;
   Pm_WriteShort(stream, 0, note_on_event.message);
 }
 
 void
-send_midi_note_off (PmStream *stream, uint8_t note) {
+send_midi_note_off (PmStream *stream, uint8_t channel, uint8_t note) {
   PmEvent note_on_event;
-  note_on_event.message = Pm_Message(NOTE_OFF, note, 0);
+  note_on_event.message = Pm_Message(NOTE_OFF | (channel & 0x0F), note, 0);
   note_on_event.timestamp = 0;
   Pm_WriteShort(stream, 0, note_on_event.message);
 }

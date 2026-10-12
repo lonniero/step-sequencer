@@ -16,13 +16,16 @@
 #define MIN_BPM             40
 #define MAX_BPM             240
 
-#define WINDOW_WIDTH  800
+#define MIDI_CHANNELS       16
+
+#define WINDOW_WIDTH  910
 #define WINDOW_HEIGHT 520
 #define MARGIN        20
 #define HEADER_HEIGHT 36
 #define TOOLBAR_Y     52
 #define LABELS_Y      98
-#define GRID_X        330
+#define CHANNEL_X     310
+#define GRID_X        440
 #define GRID_Y        120
 #define GRID_WIDTH    450
 #define GRID_GAP      2
@@ -50,9 +53,12 @@ typedef struct Track {
   unsigned int id;
   unsigned int steps;
   unsigned int midi_note;
+  unsigned int midi_channel; // 1-16
   unsigned int current_step;
   uint64_t sequence;
   bool playing;
+  unsigned int playing_note;    // note and channel of the sounding note, so note off matches it
+  unsigned int playing_channel; // even if detune, note or channel changed since note on
 } Track;
 
 typedef struct Step {
@@ -63,6 +69,7 @@ typedef struct Step {
 double bpm = 120.0; // guarded by lock
 const int beats_per_loop = 4;
 bool running = true; // guarded by lock; once false, tick never touches MIDI again
+bool transport_playing = false; // guarded by lock; play/stop state
 
 Loop loop;
 Track tracks[TRACKS_LENGTH];
@@ -111,6 +118,7 @@ init_tracks (void) {
     tracks[i].id = i;
     tracks[i].steps = 16;
     tracks[i].midi_note = 40 + i;
+    tracks[i].midi_channel = 1;
   }
 }
 
@@ -123,15 +131,22 @@ init_steps (void) {
 }
 
 void
-run_step (Track *track) {
+release_track (Track *track) {
   if (track->playing) {
-    send_midi_note_off(midi_output_stream, track->midi_note);
+    send_midi_note_off(midi_output_stream, track->playing_channel - 1, track->playing_note);
     track->playing = false;
   }
+}
+
+void
+run_step (Track *track) {
+  release_track(track);
   if (bit_by_position(track->sequence, track->current_step)) {
     signed int detune = steps[(track->id * MAX_STEPS) + track->current_step].detune;
     unsigned int velocity = steps[(track->id * MAX_STEPS) + track->current_step].velocity;
-    send_midi_note_on(midi_output_stream, track->midi_note + detune, velocity);
+    track->playing_note = track->midi_note + detune;
+    track->playing_channel = track->midi_channel;
+    send_midi_note_on(midi_output_stream, track->playing_channel - 1, track->playing_note, velocity);
     track->playing = true;
   }
   track->current_step++;
@@ -168,17 +183,52 @@ set_track_steps (Track *track, unsigned int steps) {
 
 void
 set_track_note (Track *track, unsigned int note) {
-  if (track->playing) {
-    send_midi_note_off(midi_output_stream, track->midi_note);
-    track->playing = false;
-  }
+  release_track(track);
   track->midi_note = note;
+}
+
+void
+set_track_channel (Track *track, unsigned int channel) {
+  release_track(track);
+  track->midi_channel = channel;
+}
+
+void
+release_all_tracks (void) {
+  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
+    release_track(&tracks[i]);
+  }
+}
+
+void
+play (void) {
+  loop.loop_start = Pt_Time();
+  transport_playing = true;
+  sync_tracks();
+}
+
+void
+stop (void) {
+  transport_playing = false;
+  release_all_tracks();
+  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
+    tracks[i].current_step = 0;
+  }
+}
+
+void
+toggle_transport (void) {
+  if (transport_playing) {
+    stop();
+  } else {
+    play();
+  }
 }
 
 static void
 tick (PtTimestamp now, void *user_data) {
   pthread_mutex_lock(&lock);
-  if (running) {
+  if (running && transport_playing) {
     double loop_ms = loop_length_ms();
     double elapsed = now - loop.loop_start;
     if (elapsed >= loop_ms) {
@@ -202,12 +252,7 @@ void
 stop_sequencer (void) {
   pthread_mutex_lock(&lock);
   running = false;
-  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
-    if (tracks[i].playing) {
-      send_midi_note_off(midi_output_stream, tracks[i].midi_note);
-      tracks[i].playing = false;
-    }
-  }
+  release_all_tracks();
   pthread_mutex_unlock(&lock);
 }
 
@@ -224,12 +269,7 @@ init_midi_output_stream (PmDeviceID output_device_id) {
 int32_t
 close_midi_output_stream (void) {
   if (!midi_output_stream) return 0;
-  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
-    if (tracks[i].playing) {
-      send_midi_note_off(midi_output_stream, tracks[i].midi_note);
-      tracks[i].playing = false;
-    }
-  }
+  release_all_tracks();
   PmError result = Pm_Close(midi_output_stream);
   midi_output_stream = NULL;
   if (result != pmNoError) {
@@ -307,18 +347,20 @@ render_header (void) {
   int beat = phase * beats_per_loop;
   for (int k = 0; k < beats_per_loop; k++) {
     int x = WINDOW_WIDTH - MARGIN - 8 - (beats_per_loop - 1 - k) * 14;
-    DrawRectangle(x, 14, 8, 8, k == beat ? ACCENT : INK_LIGHT);
+    DrawRectangle(x, 14, 8, 8, transport_playing && k == beat ? ACCENT : INK_LIGHT);
   }
 }
 
 void
 render_toolbar (void) {
+  if (GuiButton((Rectangle){CHANNEL_X, TOOLBAR_Y, 100, CELL_HEIGHT}, transport_playing ? "STOP" : "PLAY")) toggle_transport();
+
   float bpm_value = bpm;
   GuiSliderBar((Rectangle){GRID_X, TOOLBAR_Y, 200, CELL_HEIGHT}, "BPM", TextFormat("%03d", (int) bpm), &bpm_value, MIN_BPM, MAX_BPM);
   if ((int) bpm_value != (int) bpm) set_bpm((int) bpm_value);
 
-  if (GuiButton((Rectangle){600, TOOLBAR_Y, 85, CELL_HEIGHT}, "RANDOMIZE")) randomize_tracks_seqs();
-  if (GuiButton((Rectangle){695, TOOLBAR_Y, 85, CELL_HEIGHT}, "CLEAR")) clear_tracks_seqs();
+  if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 180, TOOLBAR_Y, 85, CELL_HEIGHT}, "RANDOMIZE")) randomize_tracks_seqs();
+  if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 85, TOOLBAR_Y, 85, CELL_HEIGHT}, "CLEAR")) clear_tracks_seqs();
 }
 
 void
@@ -336,6 +378,10 @@ render_track (Track *track) {
   GuiSpinner((Rectangle){200, y, 100, CELL_HEIGHT}, NULL, &steps, 1, MAX_STEPS, false);
   if (steps != (int) track->steps) set_track_steps(track, steps);
 
+  int channel = track->midi_channel;
+  GuiSpinner((Rectangle){CHANNEL_X, y, 100, CELL_HEIGHT}, NULL, &channel, 1, MIDI_CHANNELS, false);
+  if (channel != (int) track->midi_channel) set_track_channel(track, channel);
+
   unsigned int playing_step = (track->current_step + track->steps - 1) % track->steps;
   for (unsigned int j = 0; j < track->steps; j++) {
     int x0 = GRID_X + (j * GRID_WIDTH) / track->steps;
@@ -348,7 +394,7 @@ render_track (Track *track) {
       selected_step = (track->id * MAX_STEPS) + j;
     }
 
-    if (j == playing_step) DrawRectangleRec(cell, on ? ACCENT : Fade(ACCENT, 0.25f));
+    if (transport_playing && j == playing_step) DrawRectangleRec(cell, on ? ACCENT : Fade(ACCENT, 0.25f));
     if (track->id * MAX_STEPS + j == (unsigned int) selected_step) DrawRectangleLinesEx(cell, 2, ACCENT);
   }
 
@@ -382,6 +428,7 @@ render_tracks (void) {
   DrawText("NO", MARGIN, LABELS_Y, 10, MUTED);
   DrawText("NOTE", 90, LABELS_Y, 10, MUTED);
   DrawText("STEPS", 200, LABELS_Y, 10, MUTED);
+  DrawText("CH", CHANNEL_X, LABELS_Y, 10, MUTED);
   for (int k = 0; k < beats_per_loop; k++) {
     DrawText(TextFormat("%d", k + 1), GRID_X + k * GRID_WIDTH / beats_per_loop, LABELS_Y, 10, MUTED);
   }
@@ -426,6 +473,8 @@ main (void) {
     ClearBackground(PAPER);
 
     pthread_mutex_lock(&lock);
+
+    if (IsKeyPressed(KEY_SPACE)) toggle_transport();
 
     render_header();
     render_footer();
