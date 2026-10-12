@@ -1,5 +1,6 @@
 #define RAYGUI_IMPLEMENTATION
 
+#include <math.h>
 #include <porttime.h>
 #include <pthread.h>
 #include <raygui.h>
@@ -18,23 +19,32 @@
 #define MIN_BPM             40
 #define MAX_BPM             240
 #define MIDI_CHANNELS       16
+#define PATTERNS_LENGTH     8
+#define CHAIN_MAX_LENGTH    16
+#define CHAIN_MAX_REPEATS   16
 
 #define WINDOW_WIDTH  800
-#define WINDOW_HEIGHT 520
+#define WINDOW_HEIGHT 564
 #define MARGIN        20
 #define HEADER_HEIGHT 36
 #define TOOLBAR_Y     52
-#define LABELS_Y      98
+#define PATTERN_Y     92
+#define LABELS_Y      142
 #define NUMBER_WIDTH  28
 #define GRID_X        330
-#define GRID_Y        120
+#define GRID_Y        164
 #define GRID_WIDTH    450
 #define GRID_GAP      2
 #define ROW_HEIGHT    38
 #define CELL_HEIGHT   28
-#define STEP_LABELS_Y 428
-#define STEP_Y        450
-#define FOOTER_Y      490
+#define STEP_LABELS_Y 472
+#define STEP_Y        494
+#define FOOTER_Y      534
+
+#define PATTERN_BUTTON_WIDTH 23
+#define PATTERN_BUTTON_STEP  26
+#define CHAIN_BUTTON_X       240
+#define CHAIN_BAR_WIDTH      40
 
 #define PAPER      (Color){232, 230, 223, 255}
 #define PAPER_DARK (Color){214, 211, 202, 255}
@@ -83,6 +93,20 @@ typedef struct Step {
   unsigned int velocity;
 } Step;
 
+// A pattern is one bar of every voice's steps. The live voices and steps arrays
+// hold the current pattern; switching stores them here and loads the next one.
+// Notes, channels and mutes belong to the tracks and are not part of a pattern.
+typedef struct Pattern {
+  uint64_t sequence[VOICES_LENGTH];
+  unsigned int steps[VOICES_LENGTH];
+  Step step_data[VOICES_LENGTH * MAX_STEPS];
+} Pattern;
+
+typedef struct ChainEntry {
+  unsigned int pattern;
+  unsigned int repeats; // bars
+} ChainEntry;
+
 double bpm = 120.0; // guarded by lock
 const int beats_per_loop = 4;
 bool running = true;            // guarded by lock; once false, tick never touches MIDI again
@@ -98,6 +122,17 @@ bool dropdown_edit_mode = false;
 
 int selected_step = 0;
 int focused_track = -1; // -1 shows all tracks, otherwise the voices of this track
+
+// All guarded by lock: tick switches patterns at the loop boundary.
+Pattern patterns[PATTERNS_LENGTH];
+int current_pattern = 0;
+int queued_pattern = -1; // switches at the next loop boundary while playing
+ChainEntry chain[CHAIN_MAX_LENGTH];
+unsigned int chain_length = 0;
+bool chain_mode = false;
+unsigned int chain_position = 0;
+unsigned int chain_bar = 0;     // bars already played of the current chain entry
+bool chain_restart = false;     // start the chain from the top at the next loop boundary
 
 uint64_t
 rand_u64 (void) {
@@ -296,7 +331,140 @@ toggle_focus (void) {
 }
 
 void
+init_patterns (void) {
+  for (size_t p = 0; p < PATTERNS_LENGTH; p++) {
+    for (size_t i = 0; i < VOICES_LENGTH; i++) {
+      patterns[p].sequence[i] = 0;
+      patterns[p].steps[i] = 16;
+    }
+    for (size_t i = 0; i < VOICES_LENGTH * MAX_STEPS; i++) {
+      patterns[p].step_data[i] = (Step){.detune = 0, .velocity = 100};
+    }
+  }
+}
+
+void
+store_pattern (unsigned int index) {
+  Pattern *pattern = &patterns[index];
+  for (size_t i = 0; i < VOICES_LENGTH; i++) {
+    pattern->sequence[i] = voices[i].sequence;
+    pattern->steps[i] = voices[i].steps;
+  }
+  for (size_t i = 0; i < VOICES_LENGTH * MAX_STEPS; i++) pattern->step_data[i] = steps[i];
+}
+
+void
+load_pattern (unsigned int index) {
+  const Pattern *pattern = &patterns[index];
+  for (size_t i = 0; i < VOICES_LENGTH; i++) {
+    voices[i].sequence = pattern->sequence[i];
+    voices[i].steps = pattern->steps[i];
+  }
+  for (size_t i = 0; i < VOICES_LENGTH * MAX_STEPS; i++) steps[i] = pattern->step_data[i];
+}
+
+void
+switch_pattern (unsigned int index) {
+  if ((int) index == current_pattern) return;
+  store_pattern(current_pattern);
+  load_pattern(index);
+  current_pattern = index;
+}
+
+bool
+pattern_has_steps (unsigned int index) {
+  for (size_t i = 0; i < VOICES_LENGTH; i++) {
+    uint64_t sequence = (int) index == current_pattern ? voices[i].sequence : patterns[index].sequence[i];
+    if (sequence) return true;
+  }
+  return false;
+}
+
+void
+copy_current_pattern_to (unsigned int index) {
+  if ((int) index == current_pattern) return;
+  store_pattern(current_pattern);
+  patterns[index] = patterns[current_pattern];
+}
+
+// Clicking a pattern leaves chain mode; while playing the switch waits for the bar to end.
+void
+select_pattern (unsigned int index) {
+  chain_mode = false;
+  if (!transport_playing) {
+    switch_pattern(index);
+    queued_pattern = -1;
+  } else {
+    queued_pattern = (int) index == current_pattern ? -1 : (int) index;
+  }
+}
+
+void
+start_chain (void) {
+  chain_position = 0;
+  chain_bar = 0;
+  chain_restart = false;
+  switch_pattern(chain[0].pattern);
+}
+
+void
+toggle_chain_mode (void) {
+  if (!chain_length) return;
+  chain_mode = !chain_mode;
+  queued_pattern = -1;
+  if (!chain_mode) return;
+  if (transport_playing) {
+    chain_restart = true;
+  } else {
+    start_chain();
+  }
+}
+
+void
+append_to_chain (unsigned int pattern) {
+  if (chain_length == CHAIN_MAX_LENGTH) return;
+  chain[chain_length++] = (ChainEntry){.pattern = pattern, .repeats = 1};
+}
+
+void
+remove_from_chain (unsigned int position) {
+  for (unsigned int i = position; i + 1 < chain_length; i++) chain[i] = chain[i + 1];
+  chain_length--;
+  if (!chain_length) {
+    chain_mode = false;
+  } else if (chain_position >= chain_length) {
+    chain_position = 0;
+    chain_bar = 0;
+  }
+}
+
+// Called at every loop boundary before the voices restart.
+void
+advance_pattern (void) {
+  if (chain_mode && chain_length) {
+    if (chain_restart) {
+      start_chain();
+      return;
+    }
+    if (++chain_bar >= chain[chain_position].repeats) {
+      chain_bar = 0;
+      chain_position = (chain_position + 1) % chain_length;
+    }
+    switch_pattern(chain[chain_position].pattern);
+  } else if (queued_pattern >= 0) {
+    switch_pattern(queued_pattern);
+    queued_pattern = -1;
+  }
+}
+
+void
 play (void) {
+  if (chain_mode && chain_length) {
+    start_chain();
+  } else if (queued_pattern >= 0) {
+    switch_pattern(queued_pattern);
+    queued_pattern = -1;
+  }
   loop.loop_start = Pt_Time();
   transport_playing = true;
   sync_voices();
@@ -328,6 +496,7 @@ tick (PtTimestamp now, void *user_data) {
     double elapsed = now - loop.loop_start;
     if (elapsed >= loop_ms) {
       loop.loop_start += loop_ms;
+      advance_pattern();
       sync_voices();
     } else {
       for (size_t i = 0; i < VOICES_LENGTH; i++) {
@@ -658,7 +827,131 @@ render_step (void) {
 
   const char *hint = focused_track >= 0 ? "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: CLOSE  HOLD CMD: CH"
                                         : "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: FOCUS  HOLD CMD: NOTE";
+  Vector2 mouse = GetMousePosition();
+  if (mouse.y >= PATTERN_Y && mouse.y < PATTERN_Y + CELL_HEIGHT) {
+    if (mouse.x < CHAIN_BUTTON_X) hint = "CLICK: SWITCH PATTERN  SHIFT+CLICK: ADD TO CHAIN  OPT+CLICK: COPY HERE";
+    else if (mouse.x < GRID_X) hint = "CLICK: PLAY THE CHAIN INSTEAD OF ONE PATTERN";
+    else hint = "CLICK: +1 BAR  SHIFT+CLICK: -1 BAR  OPT+CLICK: REMOVE";
+  }
   DrawText(hint, WINDOW_WIDTH - MARGIN - MeasureText(hint, 10), STEP_Y + 9, 10, MUTED);
+}
+
+Rectangle
+pattern_button_bounds (unsigned int index) {
+  return (Rectangle){MARGIN + index * PATTERN_BUTTON_STEP, PATTERN_Y, PATTERN_BUTTON_WIDTH, CELL_HEIGHT};
+}
+
+bool
+clicked (Rectangle bounds) {
+  return !GuiIsLocked() && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), bounds);
+}
+
+bool
+shift_down (void) {
+  return IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+}
+
+// Bars are CHAIN_BAR_WIDTH wide until the whole chain would overflow the grid width.
+float
+chain_bar_width (void) {
+  unsigned int bars = 0;
+  for (unsigned int i = 0; i < chain_length; i++) bars += chain[i].repeats;
+  float fit = (float) GRID_WIDTH / bars;
+  return fit < CHAIN_BAR_WIDTH ? fit : CHAIN_BAR_WIDTH;
+}
+
+void
+draw_centered_text (const char *text, Rectangle bounds, Color color) {
+  int width = MeasureText(text, 10);
+  DrawText(text, bounds.x + (bounds.width - width) / 2, bounds.y + (bounds.height - 10) / 2, 10, color);
+}
+
+// Pattern buttons: click switches (queued until the bar ends while playing),
+// shift-click appends to the chain, opt-click copies the current pattern there.
+void
+render_pattern_buttons (void) {
+  bool blink = fmod(GetTime(), 0.5) < 0.25;
+  for (unsigned int i = 0; i < PATTERNS_LENGTH; i++) {
+    Rectangle bounds = pattern_button_bounds(i);
+    if (clicked(bounds)) {
+      if (shift_down()) {
+        append_to_chain(i);
+      } else if (option_down()) {
+        copy_current_pattern_to(i);
+      } else {
+        select_pattern(i);
+      }
+    }
+
+    bool current = (int) i == current_pattern;
+    bool queued = (int) i == queued_pattern;
+    bool hover = !GuiIsLocked() && CheckCollisionPointRec(GetMousePosition(), bounds);
+    Color fill = current ? INK : queued && blink ? ACCENT : hover ? PAPER_DARK : background_color();
+    Color text = current ? PAPER : pattern_has_steps(i) || queued ? INK : MUTED;
+    DrawRectangleRec(bounds, fill);
+    DrawRectangleLinesEx(bounds, 1, INK);
+    draw_centered_text(TextFormat("%c", 'A' + i), bounds, text);
+  }
+
+  Rectangle chain_button = {CHAIN_BUTTON_X, PATTERN_Y, GRID_X - CHAIN_BUTTON_X - 30, CELL_HEIGHT};
+  if (clicked(chain_button)) toggle_chain_mode();
+  DrawRectangleRec(chain_button, chain_mode ? ACCENT : background_color());
+  DrawRectangleLinesEx(chain_button, 1, chain_length ? INK : MUTED);
+  draw_centered_text("CHAIN", chain_button, chain_length ? INK : MUTED);
+}
+
+// The chain as a timeline: each entry is as wide as the bars it plays, with a tick per bar.
+// Click adds a bar, shift-click removes one, opt-click removes the entry.
+void
+render_chain (void) {
+  if (!chain_length) {
+    DrawText("SHIFT+CLICK A PATTERN TO ADD IT TO THE CHAIN", GRID_X, PATTERN_Y + 9, 10, MUTED);
+    return;
+  }
+
+  float bar_width = chain_bar_width();
+  float x = GRID_X;
+  double phase = (Pt_Time() - loop.loop_start) / loop_length_ms();
+  if (phase > 1) phase = 1;
+
+  for (unsigned int i = 0; i < chain_length; i++) {
+    ChainEntry *entry = &chain[i];
+    Rectangle bounds = {x, PATTERN_Y, entry->repeats * bar_width - GRID_GAP, CELL_HEIGHT};
+    x += entry->repeats * bar_width;
+
+    if (clicked(bounds)) {
+      if (option_down()) {
+        remove_from_chain(i);
+        return; // entries shifted, draw them next frame
+      } else if (shift_down()) {
+        if (entry->repeats > 1) entry->repeats--;
+      } else if (entry->repeats < CHAIN_MAX_REPEATS) {
+        entry->repeats++;
+      }
+      bounds.width = entry->repeats * bar_width - GRID_GAP;
+    }
+
+    bool active = chain_mode && i == chain_position;
+    DrawRectangleRec(bounds, active ? Fade(ACCENT, 0.3f) : background_color());
+    if (active && transport_playing && !chain_restart) {
+      float progress = (chain_bar + phase) * bar_width;
+      DrawRectangle(bounds.x, bounds.y, progress < bounds.width ? progress : bounds.width, bounds.height, ACCENT);
+    }
+    for (unsigned int bar = 1; bar < entry->repeats; bar++) {
+      DrawRectangle(bounds.x + bar * bar_width - 1, bounds.y + CELL_HEIGHT - 6, 1, 6, MUTED);
+    }
+    DrawRectangleLinesEx(bounds, 1, INK);
+
+    const char *label = TextFormat("%c x%u", 'A' + entry->pattern, entry->repeats);
+    if (MeasureText(label, 10) + 6 > bounds.width) label = TextFormat("%c", 'A' + entry->pattern);
+    if (MeasureText(label, 10) + 4 <= bounds.width) draw_centered_text(label, bounds, INK);
+  }
+}
+
+void
+render_patterns (void) {
+  render_pattern_buttons();
+  render_chain();
 }
 
 void
@@ -683,7 +976,7 @@ render_tracks (void) {
 void
 render_footer (void) {
   const char *output = dropdown_active > 0 ? midi_output_devices[dropdown_active - 1].name : "NONE";
-  const char *info = TextFormat("%d/4  %.0f MS / LOOP", beats_per_loop, loop_length_ms());
+  const char *info = TextFormat("PATTERN %c  %d/4  %.0f MS / LOOP", 'A' + current_pattern, beats_per_loop, loop_length_ms());
 
   DrawRectangle(MARGIN, FOOTER_Y, WINDOW_WIDTH - 2 * MARGIN, 1, rule_color());
   DrawRectangle(MARGIN, FOOTER_Y + 11, 6, 6, midi_output_stream ? ACCENT : MUTED);
@@ -699,6 +992,7 @@ main (void) {
 
   init_tracks();
   init_steps();
+  init_patterns();
 
   list_midi_devices();
   randomize_voices(0, TRACKS_LENGTH, VOICES_PER_TRACK);
@@ -724,6 +1018,7 @@ main (void) {
     render_footer();
     if (dropdown_edit_mode) GuiLock();
     render_toolbar();
+    render_patterns();
     render_tracks();
     render_step();
     GuiUnlock();
