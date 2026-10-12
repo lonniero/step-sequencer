@@ -19,15 +19,14 @@
 #define MAX_BPM             240
 #define MIDI_CHANNELS       16
 
-#define WINDOW_WIDTH  910
+#define WINDOW_WIDTH  800
 #define WINDOW_HEIGHT 520
 #define MARGIN        20
 #define HEADER_HEIGHT 36
 #define TOOLBAR_Y     52
 #define LABELS_Y      98
 #define NUMBER_WIDTH  28
-#define CHANNEL_X     310
-#define GRID_X        440
+#define GRID_X        330
 #define GRID_Y        120
 #define GRID_WIDTH    450
 #define GRID_GAP      2
@@ -167,7 +166,7 @@ void
 init_tracks (void) {
   for (size_t i = 0; i < TRACKS_LENGTH; i++) {
     tracks[i].id = i;
-    tracks[i].midi_channel = 1;
+    tracks[i].midi_channel = i + 1;
   }
   for (size_t i = 0; i < VOICES_LENGTH; i++) {
     voices[i].id = i;
@@ -466,10 +465,17 @@ option_down (void) {
   return IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
 }
 
+// The channel and note spinners share a column; holding cmd swaps them.
+// Tracks show the channel by default, focused voices (which share a channel) the note.
+bool
+show_note_column (void) {
+  return in_focus() != command_down();
+}
+
 void
 render_dropdown (void) {
   int previous = dropdown_active;
-  if (GuiDropdownBox((Rectangle){MARGIN, TOOLBAR_Y, 260, CELL_HEIGHT}, midi_output_labels, &dropdown_active, dropdown_edit_mode)) {
+  if (GuiDropdownBox((Rectangle){MARGIN, TOOLBAR_Y, 180, CELL_HEIGHT}, midi_output_labels, &dropdown_active, dropdown_edit_mode)) {
     dropdown_edit_mode = !dropdown_edit_mode;
   }
   if (dropdown_active != previous) select_midi_output(dropdown_active);
@@ -495,7 +501,7 @@ render_header (void) {
 
 void
 render_toolbar (void) {
-  if (GuiButton((Rectangle){CHANNEL_X, TOOLBAR_Y, 100, CELL_HEIGHT}, transport_playing ? "STOP" : "PLAY")) toggle_transport();
+  if (GuiButton((Rectangle){210, TOOLBAR_Y, 80, CELL_HEIGHT}, transport_playing ? "STOP" : "PLAY")) toggle_transport();
 
   float bpm_value = bpm;
   GuiSliderBar((Rectangle){GRID_X, TOOLBAR_Y, 150, CELL_HEIGHT}, "BPM", TextFormat("%03d", (int) bpm), &bpm_value, MIN_BPM, MAX_BPM);
@@ -591,17 +597,19 @@ render_row (Voice *voice, unsigned int row) {
   unsigned int extra = focused_track >= 0 ? 0 : extra_voices_in_use(track->id);
   if (extra) DrawText(TextFormat("+%u", extra), 52, y + 20, 10, ACCENT);
 
-  int note = voice->midi_note;
-  GuiSpinner((Rectangle){90, y, 100, CELL_HEIGHT}, NULL, &note, 0, 127, false);
-  if (note != (int) voice->midi_note) set_voice_note(voice, note);
+  if (show_note_column()) {
+    int note = voice->midi_note;
+    GuiSpinner((Rectangle){90, y, 100, CELL_HEIGHT}, NULL, &note, 0, 127, false);
+    if (note != (int) voice->midi_note) set_voice_note(voice, note);
+  } else {
+    int channel = track->midi_channel;
+    GuiSpinner((Rectangle){90, y, 100, CELL_HEIGHT}, NULL, &channel, 1, MIDI_CHANNELS, false);
+    if (channel != (int) track->midi_channel) set_track_channel(track, channel);
+  }
 
   int steps = voice->steps;
   GuiSpinner((Rectangle){200, y, 100, CELL_HEIGHT}, NULL, &steps, 1, MAX_STEPS, false);
   if (steps != (int) voice->steps) set_voice_steps(voice, steps);
-
-  int channel = track->midi_channel;
-  GuiSpinner((Rectangle){CHANNEL_X, y, 100, CELL_HEIGHT}, NULL, &channel, 1, MIDI_CHANNELS, false);
-  if (channel != (int) track->midi_channel) set_track_channel(track, channel);
 
   unsigned int playing_step = (voice->current_step + voice->steps - 1) % voice->steps;
   for (unsigned int j = 0; j < voice->steps; j++) {
@@ -648,17 +656,16 @@ render_step (void) {
   GuiSpinner((Rectangle){200, STEP_Y, 100, CELL_HEIGHT}, NULL, &velocity, 1, 127, false);
   if (velocity != (int) step->velocity) step->velocity = velocity;
 
-  const char *hint = focused_track >= 0 ? "CLICK NO: MUTE   CMD-CLICK: SOLO   OPT-CLICK / F: CLOSE FOCUS   SPACE: PLAY"
-                                        : "CLICK NO: MUTE   CMD-CLICK: SOLO   OPT-CLICK / F: FOCUS   SPACE: PLAY";
+  const char *hint = focused_track >= 0 ? "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: CLOSE  HOLD CMD: CH"
+                                        : "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: FOCUS  HOLD CMD: NOTE";
   DrawText(hint, WINDOW_WIDTH - MARGIN - MeasureText(hint, 10), STEP_Y + 9, 10, MUTED);
 }
 
 void
 render_tracks (void) {
   DrawText(focused_track >= 0 ? "VOICE" : "NO", MARGIN, LABELS_Y, 10, MUTED);
-  DrawText("NOTE", 90, LABELS_Y, 10, MUTED);
+  DrawText(show_note_column() ? "NOTE" : "CH", 90, LABELS_Y, 10, MUTED);
   DrawText("STEPS", 200, LABELS_Y, 10, MUTED);
-  DrawText("CH", CHANNEL_X, LABELS_Y, 10, MUTED);
   for (int k = 0; k < beats_per_loop; k++) {
     DrawText(TextFormat("%d", k + 1), GRID_X + k * GRID_WIDTH / beats_per_loop, LABELS_Y, 10, MUTED);
   }
