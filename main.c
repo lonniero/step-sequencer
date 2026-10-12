@@ -6,7 +6,10 @@
 #include <raygui.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 
 #include "midi.h"
 #include "raylib.h"
@@ -650,6 +653,261 @@ render_dropdown (void) {
   if (dropdown_active != previous) select_midi_output(dropdown_active);
 }
 
+// Projects are plain text: a magic/version line, then one record per line.
+// Unknown or out-of-range records are skipped, so older files keep loading.
+#define PROJECT_MAGIC    "SEQ08"
+#define PROJECT_VERSION  1
+#define AUTOSAVE_SECONDS 30
+
+typedef enum FileAction {
+  FILE_ACTION_NONE,
+  FILE_ACTION_SAVE,
+  FILE_ACTION_SAVE_AS,
+  FILE_ACTION_OPEN,
+} FileAction;
+
+char project_path[PATH_MAX] = ""; // empty until saved or opened
+FileAction pending_file_action = FILE_ACTION_NONE; // run after the frame, outside the lock
+char status_message[128] = "";
+double status_until = 0;
+
+void
+set_status (const char *message) {
+  snprintf(status_message, sizeof status_message, "%s", message);
+  status_until = GetTime() + 3;
+}
+
+const char *
+path_basename (const char *path) {
+  const char *slash = strrchr(path, '/');
+  return slash ? slash + 1 : path;
+}
+
+void
+autosave_path (char *out, size_t size) {
+  const char *home = getenv("HOME");
+  snprintf(out, size, "%s/Library/Application Support/StepSequencer", home ? home : ".");
+  mkdir(out, 0755);
+  strlcat(out, "/last-session.seq", size);
+}
+
+bool
+write_project (const char *path) {
+  store_pattern(current_pattern);
+  FILE *file = fopen(path, "w");
+  if (!file) return false;
+
+  fprintf(file, "%s %d\n", PROJECT_MAGIC, PROJECT_VERSION);
+  fprintf(file, "bpm %d\n", (int) bpm);
+  fprintf(file, "current_pattern %d\n", current_pattern);
+  fprintf(file, "chain_mode %d\n", chain_mode);
+  if (project_path[0]) fprintf(file, "project_path %s\n", project_path);
+  if (dropdown_active > 0) fprintf(file, "output %s\n", midi_output_devices[dropdown_active - 1].name);
+  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
+    fprintf(file, "track %zu %u %d %d\n", i, tracks[i].midi_channel, tracks[i].muted, tracks[i].soloed);
+  }
+  for (size_t i = 0; i < VOICES_LENGTH; i++) {
+    const Voice *voice = &voices[i];
+    fprintf(file, "voice %zu %u %d %d %d\n", i, voice->midi_note, voice->note_edited, voice->muted, voice->soloed);
+  }
+  for (size_t p = 0; p < PATTERNS_LENGTH; p++) {
+    const Pattern *pattern = &patterns[p];
+    for (size_t i = 0; i < VOICES_LENGTH; i++) {
+      if (pattern->sequence[i] || pattern->steps[i] != 16) {
+        fprintf(file, "pattern %zu %zu %u %llx\n", p, i, pattern->steps[i], (unsigned long long) pattern->sequence[i]);
+      }
+    }
+    for (size_t k = 0; k < VOICES_LENGTH * MAX_STEPS; k++) {
+      const Step *step = &pattern->step_data[k];
+      if (step->detune || step->velocity != 100) fprintf(file, "step %zu %zu %d %u\n", p, k, step->detune, step->velocity);
+    }
+  }
+  for (unsigned int i = 0; i < chain_length; i++) {
+    fprintf(file, "chain %u %u\n", chain[i].pattern, chain[i].repeats);
+  }
+
+  bool ok = !ferror(file);
+  return fclose(file) == 0 && ok;
+}
+
+void
+reset_project (void) {
+  memset(tracks, 0, sizeof tracks);
+  memset(voices, 0, sizeof voices);
+  init_tracks();
+  init_steps();
+  init_patterns();
+  current_pattern = 0;
+  queued_pattern = -1;
+  chain_length = 0;
+  chain_mode = false;
+  chain_position = 0;
+  chain_bar = 0;
+  chain_restart = false;
+  focused_track = -1;
+  selected_step = 0;
+}
+
+void
+select_output_by_name (const char *name) {
+  for (int i = 0; i < midi_output_count; i++) {
+    if (strcmp(midi_output_devices[i].name, name) == 0) {
+      dropdown_active = i + 1;
+      select_midi_output(dropdown_active);
+      return;
+    }
+  }
+}
+
+// restore_session also restores which project file the session belonged to.
+bool
+read_project (const char *path, bool restore_session) {
+  FILE *file = fopen(path, "r");
+  if (!file) return false;
+
+  char line[PATH_MAX + 32];
+  char magic[16];
+  int version;
+  if (!fgets(line, sizeof line, file) || sscanf(line, "%15s %d", magic, &version) != 2 ||
+      strcmp(magic, PROJECT_MAGIC) != 0 || version > PROJECT_VERSION) {
+    fclose(file);
+    return false;
+  }
+
+  stop();
+  reset_project();
+  project_path[0] = '\0';
+  char output[256] = "";
+
+  while (fgets(line, sizeof line, file)) {
+    line[strcspn(line, "\n")] = '\0';
+    unsigned int a, b, c, d, e;
+    int n;
+    unsigned long long sequence;
+
+    if (sscanf(line, "bpm %d", &n) == 1) {
+      if (n >= MIN_BPM && n <= MAX_BPM) bpm = n;
+    } else if (sscanf(line, "current_pattern %u", &a) == 1) {
+      if (a < PATTERNS_LENGTH) current_pattern = a;
+    } else if (sscanf(line, "chain_mode %u", &a) == 1) {
+      chain_mode = a;
+    } else if (strncmp(line, "project_path ", 13) == 0) {
+      if (restore_session) snprintf(project_path, sizeof project_path, "%s", line + 13);
+    } else if (strncmp(line, "output ", 7) == 0) {
+      snprintf(output, sizeof output, "%s", line + 7);
+    } else if (sscanf(line, "track %u %u %u %u", &a, &b, &c, &d) == 4) {
+      if (a < TRACKS_LENGTH && b >= 1 && b <= MIDI_CHANNELS) {
+        tracks[a].midi_channel = b;
+        tracks[a].muted = c;
+        tracks[a].soloed = d;
+      }
+    } else if (sscanf(line, "voice %u %u %u %u %u", &a, &b, &c, &d, &e) == 5) {
+      if (a < VOICES_LENGTH && b <= 127) {
+        voices[a].midi_note = b;
+        voices[a].note_edited = c;
+        voices[a].muted = d;
+        voices[a].soloed = e;
+      }
+    } else if (sscanf(line, "pattern %u %u %u %llx", &a, &b, &c, &sequence) == 4) {
+      if (a < PATTERNS_LENGTH && b < VOICES_LENGTH && c >= 1 && c <= MAX_STEPS) {
+        patterns[a].steps[b] = c;
+        patterns[a].sequence[b] = sequence & steps_mask(c);
+      }
+    } else if (sscanf(line, "step %u %u %d %u", &a, &b, &n, &c) == 4) {
+      if (a < PATTERNS_LENGTH && b < VOICES_LENGTH * MAX_STEPS && n >= -36 && n <= 36 && c >= 1 && c <= 127) {
+        patterns[a].step_data[b] = (Step){.detune = n, .velocity = c};
+      }
+    } else if (sscanf(line, "chain %u %u", &a, &b) == 2) {
+      if (a < PATTERNS_LENGTH && b >= 1 && b <= CHAIN_MAX_REPEATS && chain_length < CHAIN_MAX_LENGTH) {
+        chain[chain_length++] = (ChainEntry){.pattern = a, .repeats = b};
+      }
+    }
+  }
+  fclose(file);
+
+  load_pattern(current_pattern);
+  if (!chain_length) chain_mode = false;
+  if (output[0]) select_output_by_name(output);
+  if (!restore_session) snprintf(project_path, sizeof project_path, "%s", path);
+  return true;
+}
+
+void
+autosave (void) {
+  char path[PATH_MAX];
+  autosave_path(path, sizeof path);
+  write_project(path);
+}
+
+// Native file dialogs via AppleScript; blocks the UI thread but not playback.
+// Returns false when cancelled.
+bool
+choose_path (bool save, char *out, size_t size) {
+  char command[PATH_MAX + 256];
+  if (save) {
+    const char *name = project_path[0] ? path_basename(project_path) : "Untitled.seq";
+    if (strpbrk(name, "\"\\'")) name = "Untitled.seq";
+    snprintf(command, sizeof command,
+             "/usr/bin/osascript -e 'activate' -e 'POSIX path of (choose file name with prompt \"Save sequencer project\" default name \"%s\")' 2>/dev/null",
+             name);
+  } else {
+    snprintf(command, sizeof command, "/usr/bin/osascript -e 'activate' -e 'POSIX path of (choose file with prompt \"Open sequencer project\")' 2>/dev/null");
+  }
+
+  FILE *process = popen(command, "r");
+  if (!process) return false;
+  bool ok = fgets(out, size, process) != NULL;
+  pclose(process);
+  out[strcspn(out, "\n")] = '\0';
+  return ok && out[0];
+}
+
+void
+run_file_action (FileAction action) {
+  char path[PATH_MAX] = "";
+  if (action == FILE_ACTION_OPEN) {
+    if (!choose_path(false, path, sizeof path)) return;
+    pthread_mutex_lock(&lock);
+    if (read_project(path, false)) {
+      set_status(TextFormat("OPENED %s", path_basename(path)));
+    } else {
+      set_status("COULD NOT OPEN THAT FILE");
+    }
+    pthread_mutex_unlock(&lock);
+    return;
+  }
+
+  if (action == FILE_ACTION_SAVE && project_path[0]) {
+    snprintf(path, sizeof path, "%s", project_path);
+  } else {
+    if (!choose_path(true, path, sizeof path)) return;
+    size_t length = strlen(path);
+    if ((length < 4 || strcmp(path + length - 4, ".seq") != 0) && length + 4 < sizeof path) strlcat(path, ".seq", sizeof path);
+  }
+
+  pthread_mutex_lock(&lock);
+  char previous[PATH_MAX];
+  snprintf(previous, sizeof previous, "%s", project_path);
+  snprintf(project_path, sizeof project_path, "%s", path);
+  if (write_project(path)) {
+    set_status(TextFormat("SAVED %s", path_basename(path)));
+  } else {
+    snprintf(project_path, sizeof project_path, "%s", previous);
+    set_status("COULD NOT SAVE THERE");
+  }
+  pthread_mutex_unlock(&lock);
+}
+
+bool
+header_button (Rectangle bounds, const char *label) {
+  Color text = in_focus() ? INK : PAPER;
+  bool hover = !GuiIsLocked() && CheckCollisionPointRec(GetMousePosition(), bounds);
+  if (hover) DrawRectangleLinesEx(bounds, 1, text);
+  int width = MeasureText(label, 10);
+  DrawText(label, bounds.x + (bounds.width - width) / 2, bounds.y + (bounds.height - 10) / 2, 10, text);
+  return hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
 void
 render_header (void) {
   DrawRectangle(0, 0, WINDOW_WIDTH, HEADER_HEIGHT, rule_color());
@@ -657,6 +915,15 @@ render_header (void) {
   if (focused_track >= 0) {
     const Track *track = &tracks[focused_track];
     DrawText(TextFormat("FOCUS  TRACK %02d  CH %d%s", track->id + 1, track->midi_channel, track_audible(track) ? "" : "  (MUTED)"), MARGIN, 13, 10, INK);
+  } else {
+    const char *name = project_path[0] ? path_basename(project_path) : "UNTITLED";
+    DrawText(TextToUpper(name), MARGIN, 13, 10, Fade(PAPER, 0.6f));
+  }
+
+  bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+  if (header_button((Rectangle){WINDOW_WIDTH - MARGIN - 160, 8, 44, 20}, "OPEN")) pending_file_action = FILE_ACTION_OPEN;
+  if (header_button((Rectangle){WINDOW_WIDTH - MARGIN - 110, 8, 44, 20}, shift ? "SAVE AS" : "SAVE")) {
+    pending_file_action = shift ? FILE_ACTION_SAVE_AS : FILE_ACTION_SAVE;
   }
 
   double phase = (Pt_Time() - loop.loop_start) / loop_length_ms();
@@ -788,7 +1055,7 @@ render_row (Voice *voice, unsigned int row) {
 
     bool on = bit_by_position(voice->sequence, j);
     if (GuiToggle(cell, NULL, &on)) {
-      voice->sequence ^= (uint64_t) 1 << j;
+      if (!command_down()) voice->sequence ^= (uint64_t) 1 << j; // cmd-click selects without toggling
       selected_step = (voice->id * MAX_STEPS) + j;
     }
 
@@ -802,6 +1069,12 @@ render_row (Voice *voice, unsigned int row) {
   if (!audible) apply_style(false);
 
   if (row < TRACKS_LENGTH - 1) DrawRectangle(MARGIN, y + ROW_HEIGHT - 5, WINDOW_WIDTH - 2 * MARGIN, 1, RULE);
+}
+
+bool
+mouse_over_grid (void) {
+  Vector2 mouse = GetMousePosition();
+  return mouse.x >= GRID_X && mouse.y >= GRID_Y && mouse.y < GRID_Y + TRACKS_LENGTH * ROW_HEIGHT;
 }
 
 void
@@ -827,6 +1100,8 @@ render_step (void) {
 
   const char *hint = focused_track >= 0 ? "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: CLOSE  HOLD CMD: CH"
                                         : "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: FOCUS  HOLD CMD: NOTE";
+  if (mouse_over_grid()) hint = "CLICK: TOGGLE STEP  CMD+CLICK: SELECT STEP TO EDIT BELOW";
+  if (GetMousePosition().y < HEADER_HEIGHT) hint = "CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
   Vector2 mouse = GetMousePosition();
   if (mouse.y >= PATTERN_Y && mouse.y < PATTERN_Y + CELL_HEIGHT) {
     if (mouse.x < CHAIN_BUTTON_X) hint = "CLICK: SWITCH PATTERN  SHIFT+CLICK: ADD TO CHAIN  OPT+CLICK: COPY HERE";
@@ -982,6 +1257,7 @@ render_footer (void) {
   DrawRectangle(MARGIN, FOOTER_Y + 11, 6, 6, midi_output_stream ? ACCENT : MUTED);
   DrawText(TextFormat("OUT  %s", TextToUpper(output)), MARGIN + 12, FOOTER_Y + 10, 10, INK);
   DrawText(info, WINDOW_WIDTH - MARGIN - MeasureText(info, 10), FOOTER_Y + 10, 10, MUTED);
+  if (GetTime() < status_until) DrawText(status_message, 300, FOOTER_Y + 10, 10, ACCENT);
 }
 
 int
@@ -995,7 +1271,10 @@ main (void) {
   init_patterns();
 
   list_midi_devices();
-  randomize_voices(0, TRACKS_LENGTH, VOICES_PER_TRACK);
+  char session[PATH_MAX];
+  autosave_path(session, sizeof session);
+  if (!read_project(session, true)) randomize_voices(0, TRACKS_LENGTH, VOICES_PER_TRACK);
+  double next_autosave = GetTime() + AUTOSAVE_SECONDS;
 
   if (Pt_Start(CLOCK_RESOLUTION_MS, tick, NULL) != ptNoError) {
     CloseWindow();
@@ -1011,7 +1290,15 @@ main (void) {
 
     if (!dropdown_edit_mode) {
       if (IsKeyPressed(KEY_SPACE)) toggle_transport();
-      if (IsKeyPressed(KEY_F)) toggle_focus();
+      if (IsKeyPressed(KEY_F) && !command_down()) toggle_focus();
+      if (command_down() && IsKeyPressed(KEY_S)) {
+        pending_file_action = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT) ? FILE_ACTION_SAVE_AS : FILE_ACTION_SAVE;
+      }
+      if (command_down() && IsKeyPressed(KEY_O)) pending_file_action = FILE_ACTION_OPEN;
+    }
+    if (GetTime() >= next_autosave) {
+      autosave();
+      next_autosave = GetTime() + AUTOSAVE_SECONDS;
     }
 
     render_header();
@@ -1027,8 +1314,17 @@ main (void) {
     pthread_mutex_unlock(&lock);
 
     EndDrawing();
+
+    if (pending_file_action != FILE_ACTION_NONE) {
+      FileAction action = pending_file_action;
+      pending_file_action = FILE_ACTION_NONE;
+      run_file_action(action);
+    }
   }
 
+  pthread_mutex_lock(&lock);
+  autosave();
+  pthread_mutex_unlock(&lock);
   stop_sequencer();
   Pt_Stop();
   close_midi_output_stream();
