@@ -168,7 +168,7 @@ init_tracks (void) {
   for (size_t i = 0; i < VOICES_LENGTH; i++) {
     voices[i].id = i;
     voices[i].steps = 16;
-    voices[i].midi_note = 40 + i / VOICES_PER_TRACK + i % VOICES_PER_TRACK;
+    voices[i].midi_note = 60 + i % VOICES_PER_TRACK;
   }
 }
 
@@ -383,35 +383,36 @@ note_name (unsigned int note) {
   return TextFormat("%s%d", names[note % 12], (int) note / 12 - 1);
 }
 
+// Called with the palette swapped to draw muted rows inverted.
 void
-setup_style (void) {
-  GuiSetStyle(DEFAULT, BACKGROUND_COLOR, ColorToInt(PAPER));
-  GuiSetStyle(DEFAULT, LINE_COLOR, ColorToInt(INK));
+setup_style (Color paper, Color paper_dark, Color ink) {
+  GuiSetStyle(DEFAULT, BACKGROUND_COLOR, ColorToInt(paper));
+  GuiSetStyle(DEFAULT, LINE_COLOR, ColorToInt(ink));
   GuiSetStyle(DEFAULT, TEXT_SIZE, 10);
   GuiSetStyle(DEFAULT, TEXT_SPACING, 1);
   GuiSetStyle(DEFAULT, BORDER_WIDTH, 1);
 
-  GuiSetStyle(DEFAULT, BORDER_COLOR_NORMAL, ColorToInt(INK));
-  GuiSetStyle(DEFAULT, BASE_COLOR_NORMAL, ColorToInt(PAPER));
-  GuiSetStyle(DEFAULT, TEXT_COLOR_NORMAL, ColorToInt(INK));
-  GuiSetStyle(DEFAULT, BORDER_COLOR_FOCUSED, ColorToInt(INK));
-  GuiSetStyle(DEFAULT, BASE_COLOR_FOCUSED, ColorToInt(PAPER_DARK));
-  GuiSetStyle(DEFAULT, TEXT_COLOR_FOCUSED, ColorToInt(INK));
-  GuiSetStyle(DEFAULT, BORDER_COLOR_PRESSED, ColorToInt(INK));
-  GuiSetStyle(DEFAULT, BASE_COLOR_PRESSED, ColorToInt(INK));
-  GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED, ColorToInt(PAPER));
+  GuiSetStyle(DEFAULT, BORDER_COLOR_NORMAL, ColorToInt(ink));
+  GuiSetStyle(DEFAULT, BASE_COLOR_NORMAL, ColorToInt(paper));
+  GuiSetStyle(DEFAULT, TEXT_COLOR_NORMAL, ColorToInt(ink));
+  GuiSetStyle(DEFAULT, BORDER_COLOR_FOCUSED, ColorToInt(ink));
+  GuiSetStyle(DEFAULT, BASE_COLOR_FOCUSED, ColorToInt(paper_dark));
+  GuiSetStyle(DEFAULT, TEXT_COLOR_FOCUSED, ColorToInt(ink));
+  GuiSetStyle(DEFAULT, BORDER_COLOR_PRESSED, ColorToInt(ink));
+  GuiSetStyle(DEFAULT, BASE_COLOR_PRESSED, ColorToInt(ink));
+  GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED, ColorToInt(paper));
   GuiSetStyle(DEFAULT, BORDER_COLOR_DISABLED, ColorToInt(MUTED));
-  GuiSetStyle(DEFAULT, BASE_COLOR_DISABLED, ColorToInt(PAPER));
+  GuiSetStyle(DEFAULT, BASE_COLOR_DISABLED, ColorToInt(paper));
   GuiSetStyle(DEFAULT, TEXT_COLOR_DISABLED, ColorToInt(MUTED));
 
-  GuiSetStyle(LABEL, TEXT_COLOR_FOCUSED, ColorToInt(INK));
-  GuiSetStyle(LABEL, TEXT_COLOR_PRESSED, ColorToInt(INK));
+  GuiSetStyle(LABEL, TEXT_COLOR_FOCUSED, ColorToInt(ink));
+  GuiSetStyle(LABEL, TEXT_COLOR_PRESSED, ColorToInt(ink));
 
-  GuiSetStyle(BUTTON, BASE_COLOR_FOCUSED, ColorToInt(INK));
-  GuiSetStyle(BUTTON, TEXT_COLOR_FOCUSED, ColorToInt(PAPER));
+  GuiSetStyle(BUTTON, BASE_COLOR_FOCUSED, ColorToInt(ink));
+  GuiSetStyle(BUTTON, TEXT_COLOR_FOCUSED, ColorToInt(paper));
   GuiSetStyle(BUTTON, BASE_COLOR_PRESSED, ColorToInt(ACCENT));
   GuiSetStyle(BUTTON, BORDER_COLOR_PRESSED, ColorToInt(ACCENT));
-  GuiSetStyle(BUTTON, TEXT_COLOR_PRESSED, ColorToInt(INK));
+  GuiSetStyle(BUTTON, TEXT_COLOR_PRESSED, ColorToInt(ink));
 
   GuiSetStyle(SLIDER, BASE_COLOR_PRESSED, ColorToInt(ACCENT));
   GuiSetStyle(SLIDER, TEXT_COLOR_FOCUSED, ColorToInt(ACCENT));
@@ -485,9 +486,8 @@ render_toolbar (void) {
 }
 
 // Row number: click mutes, cmd-click solos, opt-click opens (main view) or closes (focus view) focus.
-// Rows that will not sound are drawn inverted; soloed rows are drawn in the accent color.
 void
-render_number (Rectangle bounds, unsigned int number, bool *muted, bool *soloed, bool audible, int focus_target) {
+handle_number_click (Rectangle bounds, bool *muted, bool *soloed, int focus_target) {
   if (!GuiIsLocked() && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), bounds)) {
     if (option_down()) {
       if (focus_target >= 0) {
@@ -503,10 +503,6 @@ render_number (Rectangle bounds, unsigned int number, bool *muted, bool *soloed,
       toggle_audibility_flag(muted);
     }
   }
-
-  if (!audible) DrawRectangleRec(bounds, INK);
-  Color color = !audible ? PAPER : *soloed ? ACCENT : INK;
-  DrawText(TextFormat("%02d", number), bounds.x + 3, bounds.y + 4, 20, color);
 }
 
 // Voices 1-7 of a track drawn as thin lanes over its main view row, one lane per voice.
@@ -539,11 +535,23 @@ render_row (Voice *voice, unsigned int row) {
   Track *track = voice_track(voice);
   Rectangle number_bounds = {MARGIN - 3, y, NUMBER_WIDTH, CELL_HEIGHT};
 
+  bool audible, soloed;
   if (focused_track >= 0) {
-    render_number(number_bounds, row + 1, &voice->muted, &voice->soloed, voice_audible_in_track(voice), -1);
+    handle_number_click(number_bounds, &voice->muted, &voice->soloed, -1);
+    audible = voice_audible_in_track(voice);
+    soloed = voice->soloed;
   } else {
-    render_number(number_bounds, row + 1, &track->muted, &track->soloed, track_audible(track), track->id);
+    handle_number_click(number_bounds, &track->muted, &track->soloed, track->id);
+    audible = track_audible(track);
+    soloed = track->soloed;
   }
+
+  // Rows that will not sound are drawn inverted; soloed rows have an accent number.
+  if (!audible) {
+    DrawRectangle(MARGIN - 3, y - 3, WINDOW_WIDTH - 2 * MARGIN + 6, CELL_HEIGHT + 6, INK);
+    setup_style(INK, INK_LIGHT, PAPER);
+  }
+  DrawText(TextFormat("%02d", row + 1), number_bounds.x + 3, y + 4, 20, soloed ? ACCENT : audible ? INK : PAPER);
 
   DrawText(note_name(voice->midi_note), 52, y + 9, 10, MUTED);
   unsigned int extra = focused_track >= 0 ? 0 : extra_voices_in_use(track->id);
@@ -578,6 +586,7 @@ render_row (Voice *voice, unsigned int row) {
   }
 
   if (focused_track < 0) render_voice_lanes(track->id, y);
+  if (!audible) setup_style(PAPER, PAPER_DARK, INK);
 
   if (row < TRACKS_LENGTH - 1) DrawRectangle(MARGIN, y + ROW_HEIGHT - 5, WINDOW_WIDTH - 2 * MARGIN, 1, RULE);
 }
@@ -643,7 +652,7 @@ int
 main (void) {
   InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "SEQ/08");
   SetTargetFPS(60);
-  setup_style();
+  setup_style(PAPER, PAPER_DARK, INK);
   Pm_Initialize();
 
   init_tracks();
