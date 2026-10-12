@@ -45,6 +45,10 @@
 #define RULE       (Color){201, 198, 188, 255}
 #define ACCENT     (Color){206, 112, 78, 255}
 
+// Focus view palette: warm paper, accent rules and active steps.
+#define FOCUS_PAPER      (Color){240, 212, 196, 255}
+#define FOCUS_PAPER_DARK (Color){228, 192, 172, 255}
+
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct Loop {
@@ -385,7 +389,7 @@ note_name (unsigned int note) {
 
 // Called with the palette swapped to draw muted rows inverted.
 void
-setup_style (Color paper, Color paper_dark, Color ink) {
+setup_style (Color paper, Color paper_dark, Color ink, Color step_on) {
   GuiSetStyle(DEFAULT, BACKGROUND_COLOR, ColorToInt(paper));
   GuiSetStyle(DEFAULT, LINE_COLOR, ColorToInt(ink));
   GuiSetStyle(DEFAULT, TEXT_SIZE, 10);
@@ -421,6 +425,35 @@ setup_style (Color paper, Color paper_dark, Color ink) {
 
   GuiSetStyle(DROPDOWNBOX, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
   GuiSetStyle(DROPDOWNBOX, TEXT_PADDING, 8);
+
+  GuiSetStyle(TOGGLE, BASE_COLOR_PRESSED, ColorToInt(step_on));
+}
+
+bool
+in_focus (void) {
+  return focused_track >= 0;
+}
+
+Color
+background_color (void) {
+  return in_focus() ? FOCUS_PAPER : PAPER;
+}
+
+// Heavy rules and the header bar turn accent in focus view.
+Color
+rule_color (void) {
+  return in_focus() ? ACCENT : INK;
+}
+
+void
+apply_style (bool inverted) {
+  Color paper = background_color();
+  Color paper_dark = in_focus() ? FOCUS_PAPER_DARK : PAPER_DARK;
+  if (inverted) {
+    setup_style(INK, INK_LIGHT, paper, in_focus() ? ACCENT : paper);
+  } else {
+    setup_style(paper, paper_dark, INK, in_focus() ? ACCENT : INK);
+  }
 }
 
 bool
@@ -444,18 +477,19 @@ render_dropdown (void) {
 
 void
 render_header (void) {
-  DrawRectangle(0, 0, WINDOW_WIDTH, HEADER_HEIGHT, INK);
+  DrawRectangle(0, 0, WINDOW_WIDTH, HEADER_HEIGHT, rule_color());
 
   if (focused_track >= 0) {
     const Track *track = &tracks[focused_track];
-    DrawText(TextFormat("FOCUS  TRACK %02d  CH %d%s", track->id + 1, track->midi_channel, track_audible(track) ? "" : "  (MUTED)"), MARGIN, 13, 10, PAPER);
+    DrawText(TextFormat("FOCUS  TRACK %02d  CH %d%s", track->id + 1, track->midi_channel, track_audible(track) ? "" : "  (MUTED)"), MARGIN, 13, 10, INK);
   }
 
   double phase = (Pt_Time() - loop.loop_start) / loop_length_ms();
   int beat = phase * beats_per_loop;
   for (int k = 0; k < beats_per_loop; k++) {
     int x = WINDOW_WIDTH - MARGIN - 8 - (beats_per_loop - 1 - k) * 14;
-    DrawRectangle(x, 14, 8, 8, transport_playing && k == beat ? ACCENT : INK_LIGHT);
+    bool lit = transport_playing && k == beat;
+    DrawRectangle(x, 14, 8, 8, in_focus() ? (lit ? PAPER : Fade(INK, 0.35f)) : (lit ? ACCENT : INK_LIGHT));
   }
 }
 
@@ -549,7 +583,7 @@ render_row (Voice *voice, unsigned int row) {
   // Rows that will not sound are drawn inverted; soloed rows have an accent number.
   if (!audible) {
     DrawRectangle(MARGIN - 3, y - 3, WINDOW_WIDTH - 2 * MARGIN + 6, CELL_HEIGHT + 6, INK);
-    setup_style(INK, INK_LIGHT, PAPER);
+    apply_style(true);
   }
   DrawText(TextFormat("%02d", row + 1), number_bounds.x + 3, y + 4, 20, soloed ? ACCENT : audible ? INK : PAPER);
 
@@ -581,12 +615,14 @@ render_row (Voice *voice, unsigned int row) {
       selected_step = (voice->id * MAX_STEPS) + j;
     }
 
-    if (transport_playing && j == playing_step) DrawRectangleRec(cell, on ? ACCENT : Fade(ACCENT, 0.25f));
-    if (voice->id * MAX_STEPS + j == (unsigned int) selected_step) DrawRectangleLinesEx(cell, 2, ACCENT);
+    // In focus view active steps are accent, so the playhead and selection use ink instead.
+    Color mark = in_focus() ? INK : ACCENT;
+    if (transport_playing && j == playing_step) DrawRectangleRec(cell, on ? mark : Fade(mark, in_focus() ? 0.15f : 0.25f));
+    if (voice->id * MAX_STEPS + j == (unsigned int) selected_step) DrawRectangleLinesEx(cell, 2, mark);
   }
 
   if (focused_track < 0) render_voice_lanes(track->id, y);
-  if (!audible) setup_style(PAPER, PAPER_DARK, INK);
+  if (!audible) apply_style(false);
 
   if (row < TRACKS_LENGTH - 1) DrawRectangle(MARGIN, y + ROW_HEIGHT - 5, WINDOW_WIDTH - 2 * MARGIN, 1, RULE);
 }
@@ -599,7 +635,7 @@ render_step (void) {
   DrawText("STEP", MARGIN, STEP_LABELS_Y, 10, MUTED);
   DrawText("DETUNE", 90, STEP_LABELS_Y, 10, MUTED);
   DrawText("VELOCITY", 200, STEP_LABELS_Y, 10, MUTED);
-  DrawRectangle(MARGIN, STEP_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, INK);
+  DrawRectangle(MARGIN, STEP_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, rule_color());
 
   DrawText(TextFormat("%02d", selected_step % MAX_STEPS + 1), MARGIN, STEP_Y + 4, 20, INK);
   DrawText(note_name(voice->midi_note + step->detune), 52, STEP_Y + 9, 10, MUTED);
@@ -626,7 +662,7 @@ render_tracks (void) {
   for (int k = 0; k < beats_per_loop; k++) {
     DrawText(TextFormat("%d", k + 1), GRID_X + k * GRID_WIDTH / beats_per_loop, LABELS_Y, 10, MUTED);
   }
-  DrawRectangle(MARGIN, GRID_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, INK);
+  DrawRectangle(MARGIN, GRID_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, rule_color());
 
   for (unsigned int row = 0; row < TRACKS_LENGTH; row++) {
     if (focused_track >= 0) {
@@ -642,7 +678,7 @@ render_footer (void) {
   const char *output = dropdown_active > 0 ? midi_output_devices[dropdown_active - 1].name : "NONE";
   const char *info = TextFormat("%d/4  %.0f MS / LOOP", beats_per_loop, loop_length_ms());
 
-  DrawRectangle(MARGIN, FOOTER_Y, WINDOW_WIDTH - 2 * MARGIN, 1, INK);
+  DrawRectangle(MARGIN, FOOTER_Y, WINDOW_WIDTH - 2 * MARGIN, 1, rule_color());
   DrawRectangle(MARGIN, FOOTER_Y + 11, 6, 6, midi_output_stream ? ACCENT : MUTED);
   DrawText(TextFormat("OUT  %s", TextToUpper(output)), MARGIN + 12, FOOTER_Y + 10, 10, INK);
   DrawText(info, WINDOW_WIDTH - MARGIN - MeasureText(info, 10), FOOTER_Y + 10, 10, MUTED);
@@ -652,7 +688,6 @@ int
 main (void) {
   InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "SEQ/08");
   SetTargetFPS(60);
-  setup_style(PAPER, PAPER_DARK, INK);
   Pm_Initialize();
 
   init_tracks();
@@ -668,9 +703,10 @@ main (void) {
 
   while (!WindowShouldClose()) {
     BeginDrawing();
-    ClearBackground(PAPER);
-
     pthread_mutex_lock(&lock);
+
+    ClearBackground(background_color());
+    apply_style(false);
 
     if (!dropdown_edit_mode) {
       if (IsKeyPressed(KEY_SPACE)) toggle_transport();
