@@ -27,26 +27,29 @@
 #define CHAIN_MAX_REPEATS   16
 
 #define WINDOW_WIDTH  800
-#define WINDOW_HEIGHT 564
+#define WINDOW_HEIGHT 582
 #define MARGIN        20
 #define HEADER_HEIGHT 36
 #define TOOLBAR_Y     52
-#define PATTERN_Y     92
-#define LABELS_Y      142
+#define LABELS_Y      98
 #define NUMBER_WIDTH  28
 #define GRID_X        330
-#define GRID_Y        164
+#define GRID_Y        120
 #define GRID_WIDTH    450
 #define GRID_GAP      2
 #define ROW_HEIGHT    38
 #define CELL_HEIGHT   28
-#define STEP_LABELS_Y 472
-#define STEP_Y        494
-#define FOOTER_Y      534
+#define STEP_LABELS_Y 428
+#define STEP_Y        450
+#define PATTERN_LABELS_Y 490
+#define PATTERN_Y     512
+#define FOOTER_Y      552
 
 #define PATTERN_BUTTON_WIDTH 23
 #define PATTERN_BUTTON_STEP  26
-#define CHAIN_BUTTON_X       240
+#define COPY_BUTTON_X        233
+#define CHAIN_BUTTON_X       281
+#define STRIP_BUTTON_WIDTH   44
 #define CHAIN_BAR_WIDTH      40
 
 #define PAPER      (Color){232, 230, 223, 255}
@@ -133,6 +136,7 @@ int queued_pattern = -1; // switches at the next loop boundary while playing
 ChainEntry chain[CHAIN_MAX_LENGTH];
 unsigned int chain_length = 0;
 bool chain_mode = false;
+bool copy_mode = false; // next pattern click copies the current pattern there
 unsigned int chain_position = 0;
 unsigned int chain_bar = 0;     // bars already played of the current chain entry
 bool chain_restart = false;     // start the chain from the top at the next loop boundary
@@ -1104,10 +1108,12 @@ render_step (void) {
   if (GetMousePosition().y < HEADER_HEIGHT) hint = "CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
   Vector2 mouse = GetMousePosition();
   if (mouse.y >= PATTERN_Y && mouse.y < PATTERN_Y + CELL_HEIGHT) {
-    if (mouse.x < CHAIN_BUTTON_X) hint = "CLICK: SWITCH PATTERN  SHIFT+CLICK: ADD TO CHAIN  OPT+CLICK: COPY HERE";
+    if (mouse.x < COPY_BUTTON_X) hint = "CLICK: SWITCH  SHIFT+CLICK: ADD TO CHAIN  OPT+CLICK: COPY CURRENT HERE";
+    else if (mouse.x < CHAIN_BUTTON_X) hint = "COPY, THEN CLICK THE PATTERN TO COPY INTO";
     else if (mouse.x < GRID_X) hint = "CLICK: PLAY THE CHAIN INSTEAD OF ONE PATTERN";
     else hint = "CLICK: +1 BAR  SHIFT+CLICK: -1 BAR  OPT+CLICK: REMOVE";
   }
+  if (copy_mode) hint = TextFormat("CLICK A PATTERN TO COPY %c INTO IT  (COPY AGAIN TO CANCEL)", 'A' + current_pattern);
   DrawText(hint, WINDOW_WIDTH - MARGIN - MeasureText(hint, 10), STEP_Y + 9, 10, MUTED);
 }
 
@@ -1151,24 +1157,37 @@ render_pattern_buttons (void) {
     if (clicked(bounds)) {
       if (shift_down()) {
         append_to_chain(i);
-      } else if (option_down()) {
+      } else if ((copy_mode || option_down()) && (int) i != current_pattern) {
+        // Copy, then move to the copy so edits leave the original untouched.
+        unsigned int source = current_pattern;
         copy_current_pattern_to(i);
+        select_pattern(i);
+        set_status(TextFormat("COPIED %c TO %c", 'A' + source, 'A' + i));
+        copy_mode = false;
       } else {
         select_pattern(i);
+        copy_mode = false;
       }
     }
 
     bool current = (int) i == current_pattern;
     bool queued = (int) i == queued_pattern;
+    bool target = copy_mode && !current;
     bool hover = !GuiIsLocked() && CheckCollisionPointRec(GetMousePosition(), bounds);
-    Color fill = current ? INK : queued && blink ? ACCENT : hover ? PAPER_DARK : background_color();
-    Color text = current ? PAPER : pattern_has_steps(i) || queued ? INK : MUTED;
+    Color fill = current ? INK : (queued || target) && blink ? ACCENT : hover ? PAPER_DARK : background_color();
+    Color text = current ? PAPER : pattern_has_steps(i) || queued || target ? INK : MUTED;
     DrawRectangleRec(bounds, fill);
     DrawRectangleLinesEx(bounds, 1, INK);
     draw_centered_text(TextFormat("%c", 'A' + i), bounds, text);
   }
 
-  Rectangle chain_button = {CHAIN_BUTTON_X, PATTERN_Y, GRID_X - CHAIN_BUTTON_X - 30, CELL_HEIGHT};
+  Rectangle copy_button = {COPY_BUTTON_X, PATTERN_Y, STRIP_BUTTON_WIDTH, CELL_HEIGHT};
+  if (clicked(copy_button)) copy_mode = !copy_mode;
+  DrawRectangleRec(copy_button, copy_mode ? ACCENT : background_color());
+  DrawRectangleLinesEx(copy_button, 1, INK);
+  draw_centered_text("COPY", copy_button, INK);
+
+  Rectangle chain_button = {CHAIN_BUTTON_X, PATTERN_Y, STRIP_BUTTON_WIDTH, CELL_HEIGHT};
   if (clicked(chain_button)) toggle_chain_mode();
   DrawRectangleRec(chain_button, chain_mode ? ACCENT : background_color());
   DrawRectangleLinesEx(chain_button, 1, chain_length ? INK : MUTED);
@@ -1225,6 +1244,9 @@ render_chain (void) {
 
 void
 render_patterns (void) {
+  DrawText("PATTERN", MARGIN, PATTERN_LABELS_Y, 10, MUTED);
+  DrawText("CHAIN", GRID_X, PATTERN_LABELS_Y, 10, MUTED);
+  DrawRectangle(MARGIN, PATTERN_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, rule_color());
   render_pattern_buttons();
   render_chain();
 }
