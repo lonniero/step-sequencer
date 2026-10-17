@@ -6,7 +6,7 @@ BIN := build/step-sequencer
 APP := build/StepSequencer.app
 
 DEPS := $(abspath build/deps)
-DEPLOYMENT_TARGET := 14.0
+DEPLOYMENT_TARGET := 11.0
 RAYLIB_VERSION := 6.0
 PORTMIDI_VERSION := v2.0.7
 
