@@ -13,8 +13,9 @@ An 8-track MIDI step sequencer for macOS, written in C with [raylib](https://www
 - Swing (50–75%) and a built-in metronome click
 - Per-step detune, velocity and nudge (up to half a step early or late): cmd-click a step to edit it
 - Choke groups A–D: tracks in the same group cut each other off, like open and closed hi-hats
-- Scales: 29 scales from major and minor to Romanian minor, Arabic, Hijaz, Persian and Hirajoshi; transpose and note edits stay in the scale and steps play quantized
+- Scales per track (set in focus view): 29 scales from major and minor to Romanian minor, Arabic, Hijaz, Persian and Hirajoshi; transpose and note edits stay in the scale and steps play quantized
 - Choose any MIDI output device from the dropdown
+- Sync to a DAW: pick a MIDI input as the clock source and the tempo, start/stop and song position follow its MIDI clock
 
 ## Build
 
@@ -30,6 +31,10 @@ make run
 The binary is written to `build/step-sequencer`.
 
 `make app` packages the release binary as `build/StepSequencer.app`, with the icon generated from `icon.png`.
+
+## Syncing to a DAW
+
+In your DAW, send MIDI clock to a port the sequencer can read, such as the IAC Driver (setup below), and pick `Clock: <port>` from the sequencer's clock dropdown. The BPM slider then shows the DAW's tempo, and play, stop and song position follow the DAW. Pick `Internal Clock` to run on its own again.
 
 ## Sending MIDI to another app
 

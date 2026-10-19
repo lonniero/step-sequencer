@@ -25,6 +25,11 @@
 #define MIN_SWING           50
 #define MAX_SWING           75
 #define NUDGE_TICKS         24 // a nudge tick is 1/24 of a step
+#define CLOCK_TICKS_PER_BEAT 24
+#define CLOCK_HISTORY        25  // tick times kept for the tempo: one beat of intervals
+#define CLOCK_GAP_MS         500 // a longer pause between ticks restarts the tempo estimate
+#define CLOCK_MIN_BPM        20
+#define CLOCK_MAX_BPM        400
 #define MAX_NUDGE           12 // half a step either way
 #define CLICK_SAMPLE_RATE   44100
 #define CLICK_BUFFER_FRAMES 256 // small, so a click starts within about one audio device period (~10 ms) of its beat
@@ -156,6 +161,8 @@ Step steps[VOICES_LENGTH * MAX_STEPS];
 
 int dropdown_active = 0;
 bool dropdown_edit_mode = false;
+int clock_dropdown_active = 0; // 0 is the internal clock, otherwise a MIDI input
+bool clock_dropdown_edit_mode = false;
 
 int selected_step = 0;
 int focused_track = -1; // -1 shows all tracks, otherwise the voices of this track
@@ -743,6 +750,26 @@ advance_pattern (void) {
   }
 }
 
+// Starts playback `elapsed` ms into a loop that started at loop_start. Steps and beats
+// before that point have passed, except that a start at the top of the loop plays step 0
+// even when it is nudged early.
+void
+play_from (double loop_start, double elapsed) {
+  loop.loop_start = loop_start;
+  transport_playing = true;
+  start_loop();
+  for (size_t i = 0; i < VOICES_LENGTH && elapsed > 0; i++) {
+    for (unsigned int j = 0; j < voices[i].steps; j++) {
+      if (note_time(&voices[i], j) < elapsed) voices[i].passed |= (uint64_t) 1 << j;
+    }
+  }
+  for (int beat = 0; beat < beats_per_loop && elapsed > 0; beat++) {
+    if (beat * loop_length_ms() / beats_per_loop < elapsed) metronome_passed |= 1 << beat;
+  }
+  advance_voices(loop_start + elapsed, elapsed);
+  advance_metronome(elapsed);
+}
+
 void
 play (void) {
   if (chain_mode && chain_length) {
@@ -751,11 +778,7 @@ play (void) {
     switch_pattern(queued_pattern);
     queued_pattern = -1;
   }
-  loop.loop_start = Pt_Time();
-  transport_playing = true;
-  start_loop();
-  advance_voices(loop.loop_start, 0);
-  advance_metronome(0);
+  play_from(Pt_Time(), 0);
 }
 
 void
@@ -778,9 +801,105 @@ toggle_transport (void) {
   }
 }
 
+// External MIDI clock, all guarded by lock. With a clock input selected, tempo follows the
+// tick rate and Start, Continue, Stop and song position drive the transport.
+PmStream *clock_input_stream = NULL;
+unsigned long clock_ticks = 0;    // ticks since song position 0
+bool clock_running = false;       // between Start/Continue and Stop
+bool clock_start_pending = false; // the next tick starts playback
+double clock_times[CLOCK_HISTORY];
+unsigned int clock_count = 0;     // ticks since the tempo estimate restarted
+char clock_input_name[256] = "";  // the selected input, also restored from the session
+
+bool
+external_clock (void) {
+  return clock_input_stream != NULL;
+}
+
+// Moves the chain to the given bar of the song, so a DAW starting mid-song lands on the right pattern.
+void
+seek_chain (unsigned long bar) {
+  unsigned int bars = 0;
+  for (unsigned int i = 0; i < chain_length; i++) bars += chain[i].repeats;
+  bar %= bars;
+  chain_position = 0;
+  while (bar >= chain[chain_position].repeats) bar -= chain[chain_position++].repeats;
+  chain_bar = bar;
+  chain_restart = false;
+  switch_pattern(chain[chain_position].pattern);
+}
+
+void
+clock_tick (double t) {
+  // Tempo from up to a beat of recent tick intervals.
+  if (clock_count && t - clock_times[(clock_count - 1) % CLOCK_HISTORY] > CLOCK_GAP_MS) clock_count = 0;
+  clock_times[clock_count++ % CLOCK_HISTORY] = t;
+  unsigned int n = clock_count < CLOCK_HISTORY ? clock_count : CLOCK_HISTORY;
+  double span = t - clock_times[(clock_count - n) % CLOCK_HISTORY];
+  if (n >= 2 && span > 0) {
+    double tempo = 60000.0 * (n - 1) / (CLOCK_TICKS_PER_BEAT * span);
+    if (tempo >= CLOCK_MIN_BPM && tempo <= CLOCK_MAX_BPM) bpm = tempo;
+  }
+
+  unsigned int ticks_per_loop = CLOCK_TICKS_PER_BEAT * beats_per_loop;
+  double loop_ms = loop_length_ms();
+  double target = (double) (clock_ticks % ticks_per_loop) / ticks_per_loop;
+  if (clock_start_pending) {
+    clock_start_pending = false;
+    clock_running = true;
+    if (chain_mode && chain_length) {
+      seek_chain(clock_ticks / ticks_per_loop);
+    } else if (queued_pattern >= 0) {
+      switch_pattern(queued_pattern);
+      queued_pattern = -1;
+    }
+    play_from(t - target * loop_ms, target * loop_ms);
+  } else if (clock_running && transport_playing) {
+    // Pull the loop phase onto the clock the shortest way round, so a bar line is never skipped or repeated.
+    double drift = target - (t - loop.loop_start) / loop_ms;
+    drift -= floor(drift + 0.5);
+    loop.loop_start -= drift * loop_ms;
+  }
+  clock_ticks++;
+}
+
+void
+handle_clock_message (PmMessage message, double t) {
+  switch (Pm_MessageStatus(message)) {
+  case MIDI_CLOCK:
+    clock_tick(t);
+    break;
+  case MIDI_START:
+    clock_ticks = 0;
+    clock_start_pending = true;
+    break;
+  case MIDI_CONTINUE:
+    clock_start_pending = true;
+    break;
+  case MIDI_STOP:
+    clock_running = false;
+    clock_start_pending = false;
+    if (transport_playing) stop();
+    break;
+  case MIDI_SONG_POSITION:
+    clock_ticks = (Pm_MessageData1(message) | Pm_MessageData2(message) << 7) * (CLOCK_TICKS_PER_BEAT / 4);
+    break;
+  }
+}
+
+void
+receive_clock (void) {
+  PmEvent events[64];
+  int count;
+  while ((count = Pm_Read(clock_input_stream, events, 64)) > 0) {
+    for (int i = 0; i < count; i++) handle_clock_message(events[i].message, events[i].timestamp);
+  }
+}
+
 static void
 tick (PtTimestamp now, void *user_data) {
   pthread_mutex_lock(&lock);
+  if (running && clock_input_stream) receive_clock();
   if (running && transport_playing) {
     double loop_ms = loop_length_ms();
     if (now - loop.loop_start >= loop_ms) {
@@ -789,8 +908,10 @@ tick (PtTimestamp now, void *user_data) {
       advance_pattern();
       start_loop();
     }
-    advance_voices(now, now - loop.loop_start);
-    advance_metronome(now - loop.loop_start);
+    // Following a clock can pull the loop start just past now.
+    double elapsed = now > loop.loop_start ? now - loop.loop_start : 0;
+    advance_voices(now, elapsed);
+    advance_metronome(elapsed);
   }
   pthread_mutex_unlock(&lock);
 }
@@ -985,6 +1106,7 @@ write_project (const char *path) {
   fprintf(file, "chain_mode %d\n", chain_mode);
   if (project_path[0]) fprintf(file, "project_path %s\n", project_path);
   if (dropdown_active > 0) fprintf(file, "output %s\n", midi_output_devices[dropdown_active - 1].name);
+  if (clock_input_name[0]) fprintf(file, "clock_input %s\n", clock_input_name);
   for (size_t i = 0; i < TRACKS_LENGTH; i++) {
     fprintf(file, "track %zu %u %d %d\n", i, tracks[i].midi_channel, tracks[i].muted, tracks[i].soloed);
     if (tracks[i].choke_group) fprintf(file, "choke %zu %u\n", i, tracks[i].choke_group);
@@ -1050,6 +1172,73 @@ select_output_by_name (const char *name) {
   }
 }
 
+// Only real-time and song position messages get through from the clock input.
+void
+select_clock_input (int index) {
+  if (clock_input_stream) Pm_Close(clock_input_stream);
+  clock_input_stream = NULL;
+  clock_running = false;
+  clock_start_pending = false;
+  clock_count = 0;
+  clock_input_name[0] = '\0';
+  clock_dropdown_active = 0;
+  if (index <= 0 || index > midi_input_count) return;
+
+  const MidiOutputDevice *device = &midi_input_devices[index - 1];
+  if (Pm_OpenInput(&clock_input_stream, device->id, NULL, 512, NULL, NULL) != pmNoError) {
+    clock_input_stream = NULL;
+    set_status("COULD NOT OPEN THAT CLOCK INPUT");
+    return;
+  }
+  Pm_SetFilter(clock_input_stream, PM_FILT_ACTIVE | PM_FILT_SYSEX | PM_FILT_NOTE | PM_FILT_CONTROL | PM_FILT_PROGRAM |
+                                       PM_FILT_PITCHBEND | PM_FILT_AFTERTOUCH | PM_FILT_MTC | PM_FILT_SONG_SELECT | PM_FILT_TUNE);
+  clock_dropdown_active = index;
+  snprintf(clock_input_name, sizeof clock_input_name, "%s", device->name);
+}
+
+// Opening an input before the tick timer runs would make PortMidi start its own timer,
+// so at launch the restored name waits in clock_input_name until main opens it.
+void
+select_clock_input_by_name (const char *name) {
+  char wanted[sizeof clock_input_name];
+  snprintf(wanted, sizeof wanted, "%s", name);
+  if (!Pt_Started()) {
+    snprintf(clock_input_name, sizeof clock_input_name, "%s", wanted);
+    return;
+  }
+  for (int i = 0; i < midi_input_count; i++) {
+    if (strcmp(midi_input_devices[i].name, wanted) == 0) {
+      select_clock_input(i + 1);
+      return;
+    }
+  }
+}
+
+void
+render_clock_dropdown (void) {
+  int previous = clock_dropdown_active;
+  if (GuiDropdownBox((Rectangle){MARGIN, TOOLBAR2_Y, 180, CELL_HEIGHT}, midi_input_labels, &clock_dropdown_active, clock_dropdown_edit_mode)) {
+    clock_dropdown_edit_mode = !clock_dropdown_edit_mode;
+  }
+  if (clock_dropdown_active != previous) select_clock_input(clock_dropdown_active);
+}
+
+// The open dropdown is drawn last, over the other, which stays locked while it is open.
+void
+render_dropdowns (void) {
+  if (clock_dropdown_edit_mode) {
+    GuiLock();
+    render_dropdown();
+    GuiUnlock();
+    render_clock_dropdown();
+  } else {
+    if (dropdown_edit_mode) GuiLock();
+    render_clock_dropdown();
+    GuiUnlock();
+    render_dropdown();
+  }
+}
+
 // restore_session also restores which project file the session belonged to.
 bool
 read_project (const char *path, bool restore_session) {
@@ -1069,6 +1258,7 @@ read_project (const char *path, bool restore_session) {
   reset_project();
   project_path[0] = '\0';
   char output[256] = "";
+  char clock_input[256] = "";
 
   while (fgets(line, sizeof line, file)) {
     line[strcspn(line, "\n")] = '\0';
@@ -1103,6 +1293,8 @@ read_project (const char *path, bool restore_session) {
       if (restore_session) snprintf(project_path, sizeof project_path, "%s", line + 13);
     } else if (strncmp(line, "output ", 7) == 0) {
       snprintf(output, sizeof output, "%s", line + 7);
+    } else if (strncmp(line, "clock_input ", 12) == 0) {
+      snprintf(clock_input, sizeof clock_input, "%s", line + 12);
     } else if (sscanf(line, "track %u %u %u %u", &a, &b, &c, &d) == 4) {
       if (a < TRACKS_LENGTH && b >= 1 && b <= MIDI_CHANNELS) {
         tracks[a].midi_channel = b;
@@ -1140,6 +1332,7 @@ read_project (const char *path, bool restore_session) {
   load_pattern(current_pattern);
   if (!chain_length) chain_mode = false;
   if (output[0]) select_output_by_name(output);
+  if (clock_input[0]) select_clock_input_by_name(clock_input);
   if (!restore_session) snprintf(project_path, sizeof project_path, "%s", path);
   return true;
 }
@@ -1303,9 +1496,12 @@ render_toolbar (void) {
   GuiSliderBar((Rectangle){GRID_X, TOOLBAR2_Y, 150, CELL_HEIGHT}, "SWING", TextFormat("%d%%", swing), &swing_value, MIN_SWING, MAX_SWING);
   swing = swing_value;
 
+  // An external clock sets the tempo, so the slider only shows it.
   float bpm_value = bpm;
-  GuiSliderBar((Rectangle){GRID_X, TOOLBAR_Y, 150, CELL_HEIGHT}, "BPM", TextFormat("%03d", (int) bpm), &bpm_value, MIN_BPM, MAX_BPM);
-  if ((int) bpm_value != (int) bpm) set_bpm((int) bpm_value);
+  if (external_clock()) GuiDisable();
+  GuiSliderBar((Rectangle){GRID_X, TOOLBAR_Y, 150, CELL_HEIGHT}, "BPM", TextFormat("%03d", (int) round(bpm)), &bpm_value, MIN_BPM, MAX_BPM);
+  if (!external_clock() && (int) bpm_value != (int) bpm) set_bpm((int) bpm_value);
+  GuiEnable();
 
   if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 250, TOOLBAR_Y, 80, CELL_HEIGHT}, focused_track >= 0 ? "CLOSE FOCUS" : "FOCUS")) toggle_focus();
 
@@ -1542,6 +1738,9 @@ render_step (void) {
   if (mouse_over_grid()) hint = "CLICK/DRAG: PAINT STEPS  CMD+CLICK: SELECT STEP TO EDIT BELOW";
   if (mouse.y >= STEP_Y && mouse.y < STEP_Y + CELL_HEIGHT) hint = "LEFT/RIGHT ARROWS NUDGE THE SELECTED STEP";
   if (mouse.y < HEADER_HEIGHT) hint = "CMD+N: NEW  CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
+  if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x < 200) {
+    hint = "FOLLOW A DAW'S MIDI CLOCK: TEMPO, START, STOP AND SONG POSITION";
+  }
   if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= 210 && mouse.x < 290) {
     hint = "METRONOME: A BUILT-IN CLICK, NOT SENT OVER MIDI";
   }
@@ -1748,7 +1947,12 @@ render_tracks (void) {
 void
 render_footer (void) {
   const char *output = dropdown_active > 0 ? midi_output_devices[dropdown_active - 1].name : "NONE";
-  const char *info = TextFormat("PATTERN %c  %d/4  %.0f MS / LOOP", 'A' + current_pattern, beats_per_loop, loop_length_ms());
+  const char *sync = "";
+  if (external_clock()) {
+    bool receiving = clock_count && Pt_Time() - clock_times[(clock_count - 1) % CLOCK_HISTORY] < CLOCK_GAP_MS;
+    sync = receiving ? TextFormat("EXT CLOCK %.1f BPM  ", bpm) : "WAITING FOR CLOCK  ";
+  }
+  const char *info = TextFormat("%sPATTERN %c  %d/4  %.0f MS / LOOP", sync, 'A' + current_pattern, beats_per_loop, loop_length_ms());
 
   DrawRectangle(MARGIN, FOOTER_Y, WINDOW_WIDTH - 2 * MARGIN, 1, rule_color());
   DrawRectangle(MARGIN, FOOTER_Y + 11, 6, 6, midi_output_stream ? ACCENT : MUTED);
@@ -1783,6 +1987,9 @@ main (void) {
     CloseWindow();
     return 1;
   }
+  pthread_mutex_lock(&lock);
+  if (clock_input_name[0]) select_clock_input_by_name(clock_input_name);
+  pthread_mutex_unlock(&lock);
 
   while (!WindowShouldClose()) {
     BeginDrawing();
@@ -1792,7 +1999,8 @@ main (void) {
     ClearBackground(background_color());
     apply_style(false);
 
-    if (!dropdown_edit_mode) {
+    bool dropdown_open = dropdown_edit_mode || clock_dropdown_edit_mode;
+    if (!dropdown_open) {
       if (IsKeyPressed(KEY_SPACE)) toggle_transport();
       if (IsKeyPressed(KEY_F) && !command_down()) toggle_focus();
       nudge_selected_step_from_keys();
@@ -1809,14 +2017,14 @@ main (void) {
 
     render_header();
     render_footer();
-    if (dropdown_edit_mode) GuiLock();
+    if (dropdown_open) GuiLock();
     render_toolbar();
     render_patterns();
     if (focused_track >= 0) render_pitch();
     render_tracks();
     render_step();
     GuiUnlock();
-    render_dropdown();
+    render_dropdowns();
     end_paint_frame();
 
     pthread_mutex_unlock(&lock);
@@ -1835,6 +2043,7 @@ main (void) {
   pthread_mutex_unlock(&lock);
   stop_sequencer();
   Pt_Stop();
+  select_clock_input(0);
   close_midi_output_stream();
   Pm_Terminate();
   UnloadAudioStream(click);
