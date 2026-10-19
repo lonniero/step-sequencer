@@ -23,6 +23,8 @@
 #define MAX_BPM             240
 #define MIN_SWING           50
 #define MAX_SWING           75
+#define NUDGE_TICKS         24 // a nudge tick is 1/24 of a step
+#define MAX_NUDGE           12 // half a step either way
 #define MIDI_CHANNELS       16
 #define PATTERNS_LENGTH     8
 #define CHAIN_MAX_LENGTH    16
@@ -91,6 +93,7 @@ typedef struct Voice {
   unsigned int current_step; // step under the playhead
   uint64_t passed;           // steps whose time has come this loop, played or not
   double release_at;         // Pt time the sounding note ends
+  bool early_next;           // step 0 of the next loop is nudged early and already played
   uint64_t sequence;
   bool playing;
   unsigned int playing_note;    // note and channel of the sounding note, so note off matches it
@@ -111,6 +114,7 @@ typedef struct Track {
 typedef struct Step {
   signed int detune;
   unsigned int velocity;
+  signed int nudge; // NUDGE_TICKS per step, negative plays early
 } Step;
 
 // A pattern is one bar of every voice's steps. The live voices and steps arrays
@@ -344,6 +348,7 @@ init_steps (void) {
   for (size_t i = 0; i < VOICES_LENGTH * MAX_STEPS; i++) {
     steps[i].detune = 0;
     steps[i].velocity = 100;
+    steps[i].nudge = 0;
   }
 }
 
@@ -411,6 +416,14 @@ step_time (const Voice *voice, unsigned int step) {
   return swing_time(step * loop_length_ms() / voice->steps);
 }
 
+// When a step's note plays: its start moved by its nudge. Step 0 nudged early comes out negative
+// and plays at the end of the loop before.
+double
+note_time (const Voice *voice, unsigned int step) {
+  double nudge = (double) steps[voice->id * MAX_STEPS + step].nudge / NUDGE_TICKS;
+  return swing_time((step + nudge) * loop_length_ms() / voice->steps);
+}
+
 // Sends a step's note, held until the next step starts.
 void
 play_step (Voice *voice, unsigned int step, double loop_start) {
@@ -435,9 +448,15 @@ advance_voices (double now, double elapsed) {
     if (voice->playing && now >= voice->release_at) release_voice(voice);
     for (unsigned int j = 0; j < voice->steps; j++) {
       uint64_t bit = (uint64_t) 1 << j;
-      if (voice->passed & bit || step_time(voice, j) > elapsed) continue;
+      if (voice->passed & bit || note_time(voice, j) > elapsed) continue;
       voice->passed |= bit;
       play_step(voice, j, loop.loop_start);
+    }
+    // Uses this loop's step data, so a pattern switch at the boundary still gets the old step 0.
+    double early = note_time(voice, 0) + loop_ms;
+    if (!voice->early_next && early < loop_ms && early <= elapsed) {
+      voice->early_next = true;
+      play_step(voice, 0, loop.loop_start + loop_ms);
     }
     unsigned int step = unswing_time(elapsed) * voice->steps / loop_ms;
     voice->current_step = step < voice->steps ? step : voice->steps - 1;
@@ -446,7 +465,10 @@ advance_voices (double now, double elapsed) {
 
 void
 start_loop (void) {
-  for (size_t i = 0; i < VOICES_LENGTH; i++) voices[i].passed = 0;
+  for (size_t i = 0; i < VOICES_LENGTH; i++) {
+    voices[i].passed = voices[i].early_next;
+    voices[i].early_next = false;
+  }
 }
 
 void
@@ -465,7 +487,7 @@ set_voice_steps (Voice *voice, unsigned int steps) {
   if (!transport_playing) return;
   double elapsed = Pt_Time() - loop.loop_start;
   for (unsigned int j = 0; j < steps; j++) {
-    if (step_time(voice, j) <= elapsed) voice->passed |= (uint64_t) 1 << j;
+    if (note_time(voice, j) <= elapsed) voice->passed |= (uint64_t) 1 << j;
   }
 }
 
@@ -697,6 +719,7 @@ stop (void) {
   for (size_t i = 0; i < VOICES_LENGTH; i++) {
     voices[i].current_step = 0;
     voices[i].passed = 0;
+    voices[i].early_next = false;
   }
 }
 
@@ -932,7 +955,9 @@ write_project (const char *path) {
     }
     for (size_t k = 0; k < VOICES_LENGTH * MAX_STEPS; k++) {
       const Step *step = &pattern->step_data[k];
-      if (step->detune || step->velocity != 100) fprintf(file, "step %zu %zu %d %u\n", p, k, step->detune, step->velocity);
+      if (step->detune || step->velocity != 100 || step->nudge) {
+        fprintf(file, "step %zu %zu %d %u %d\n", p, k, step->detune, step->velocity, step->nudge);
+      }
     }
   }
   for (unsigned int i = 0; i < chain_length; i++) {
@@ -1041,8 +1066,10 @@ read_project (const char *path, bool restore_session) {
         patterns[a].sequence[b] = sequence & steps_mask(c);
       }
     } else if (sscanf(line, "step %u %u %d %u", &a, &b, &n, &c) == 4) {
-      if (a < PATTERNS_LENGTH && b < VOICES_LENGTH * MAX_STEPS && n >= -36 && n <= 36 && c >= 1 && c <= 127) {
-        patterns[a].step_data[b] = (Step){.detune = n, .velocity = c};
+      int nudge = 0; // older files have no nudge
+      sscanf(line, "step %*u %*u %*d %*u %d", &nudge);
+      if (a < PATTERNS_LENGTH && b < VOICES_LENGTH * MAX_STEPS && n >= -36 && n <= 36 && c >= 1 && c <= 127 && abs(nudge) <= MAX_NUDGE) {
+        patterns[a].step_data[b] = (Step){.detune = n, .velocity = c, .nudge = nudge};
       }
     } else if (sscanf(line, "chain %u %u", &a, &b) == 2) {
       if (a < PATTERNS_LENGTH && b >= 1 && b <= CHAIN_MAX_REPEATS && chain_length < CHAIN_MAX_LENGTH) {
@@ -1333,9 +1360,9 @@ render_row (Voice *voice, unsigned int row) {
     if (channel != (int) track->midi_channel) set_track_channel(track, channel);
   }
 
-  int steps = voice->steps;
-  GuiSpinner((Rectangle){200, y, 90, CELL_HEIGHT}, NULL, &steps, 1, MAX_STEPS, false);
-  if (steps != (int) voice->steps) set_voice_steps(voice, steps);
+  int step_count = voice->steps;
+  GuiSpinner((Rectangle){200, y, 90, CELL_HEIGHT}, NULL, &step_count, 1, MAX_STEPS, false);
+  if (step_count != (int) voice->steps) set_voice_steps(voice, step_count);
 
   // Choke group: click cycles none, A-D; shift-click goes back.
   if (focused_track < 0) {
@@ -1357,6 +1384,10 @@ render_row (Voice *voice, unsigned int row) {
     bool drawn = on;
     GuiToggle(cell, NULL, &drawn); // draws the cell only, paint_cell handles the clicks
 
+    // Nudged steps get a notch on the side they lean towards.
+    int nudge = steps[voice->id * MAX_STEPS + j].nudge;
+    if (on && nudge) DrawRectangle(nudge < 0 ? cell.x + 3 : cell.x + cell.width - 5, cell.y + 5, 2, cell.height - 10, background_color());
+
     // In focus view active steps are accent, so the playhead and selection use ink instead.
     Color mark = in_focus() ? INK : ACCENT;
     if (transport_playing && j == playing_step) DrawRectangleRec(cell, on ? mark : Fade(mark, in_focus() ? 0.15f : 0.25f));
@@ -1367,6 +1398,13 @@ render_row (Voice *voice, unsigned int row) {
   if (!audible) apply_style(false);
 
   if (row < TRACKS_LENGTH - 1) DrawRectangle(MARGIN, y + ROW_HEIGHT - 5, WINDOW_WIDTH - 2 * MARGIN, 1, RULE);
+}
+
+void
+nudge_selected_step_from_keys (void) {
+  Step *step = &steps[selected_step];
+  if ((IsKeyPressed(KEY_LEFT) || IsKeyPressedRepeat(KEY_LEFT)) && step->nudge > -MAX_NUDGE) step->nudge--;
+  if ((IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT)) && step->nudge < MAX_NUDGE) step->nudge++;
 }
 
 bool
@@ -1383,6 +1421,7 @@ render_step (void) {
   DrawText("STEP", MARGIN, STEP_LABELS_Y, 10, MUTED);
   DrawText("DETUNE", 90, STEP_LABELS_Y, 10, MUTED);
   DrawText("VELOCITY", 200, STEP_LABELS_Y, 10, MUTED);
+  DrawText("NUDGE", 310, STEP_LABELS_Y, 10, MUTED);
   DrawRectangle(MARGIN, STEP_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, rule_color());
 
   DrawText(TextFormat("%02d", selected_step % MAX_STEPS + 1), MARGIN, STEP_Y + 4, 20, INK);
@@ -1399,6 +1438,10 @@ render_step (void) {
   GuiSpinner((Rectangle){200, STEP_Y, 100, CELL_HEIGHT}, NULL, &velocity, 1, 127, false);
   if (velocity != (int) step->velocity) step->velocity = velocity;
 
+  GuiSpinner((Rectangle){310, STEP_Y, 100, CELL_HEIGHT}, NULL, &step->nudge, -MAX_NUDGE, MAX_NUDGE, false);
+  const char *lean = step->nudge < 0 ? "EARLY" : step->nudge > 0 ? "LATE" : "ON GRID";
+  DrawText(TextFormat("%s  %d/%d STEP", lean, abs(step->nudge), NUDGE_TICKS), 420, STEP_Y + 9, 10, step->nudge ? ACCENT : MUTED);
+
   const char *hint = focused_track >= 0 ? "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: CLOSE  HOLD CMD: CH"
                                         : "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: FOCUS  HOLD CMD: NOTE";
   Vector2 mouse = GetMousePosition();
@@ -1406,6 +1449,7 @@ render_step (void) {
     hint = "CHOKE GROUP: TRACKS IN THE SAME GROUP CUT EACH OTHER OFF";
   }
   if (mouse_over_grid()) hint = "CLICK/DRAG: PAINT STEPS  CMD+CLICK: SELECT STEP TO EDIT BELOW";
+  if (mouse.y >= STEP_Y && mouse.y < STEP_Y + CELL_HEIGHT) hint = "LEFT/RIGHT ARROWS NUDGE THE SELECTED STEP";
   if (mouse.y < HEADER_HEIGHT) hint = "CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
   if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= WINDOW_WIDTH - MARGIN - 165) {
     hint = "MOVE EVERY TRACK ONE OF ITS OWN STEPS, WRAPPING AROUND THE BAR";
@@ -1417,13 +1461,13 @@ render_step (void) {
     else hint = "CLICK: +1 BAR  SHIFT+CLICK: -1 BAR  OPT+CLICK: REMOVE";
   }
   if (mouse.y >= PITCH_Y && mouse.y < PITCH_Y + CELL_HEIGHT) {
-    if (mouse.x < 90) hint = "SCALE ON: NOTE EDITS AND TRANSPOSE STAY IN THE SCALE, STEPS PLAY QUANTIZED";
+    if (mouse.x < 90) hint = "ON: NOTE EDITS STAY IN THE SCALE AND STEPS PLAY QUANTIZED";
     else if (mouse.x < APPLY_BUTTON_X) hint = "PICK A ROOT AND SCALE, THEN APPLY";
     else if (mouse.x < TRANSPOSE_X) hint = "SET THE ROWS TO THE SCALE, GOING UP FROM THE ROOT";
     else hint = focused_track >= 0 ? "TRANSPOSE THIS TRACK'S VOICES" : "TRANSPOSE EVERY TRACK";
   }
   if (copy_mode) hint = TextFormat("CLICK A PATTERN TO COPY %c INTO IT  (COPY AGAIN TO CANCEL)", 'A' + current_pattern);
-  DrawText(hint, WINDOW_WIDTH - MARGIN - MeasureText(hint, 10), STEP_Y + 9, 10, MUTED);
+  DrawText(hint, WINDOW_WIDTH - MARGIN - MeasureText(hint, 10), STEP_LABELS_Y, 10, MUTED);
 }
 
 Rectangle
@@ -1654,6 +1698,7 @@ main (void) {
     if (!dropdown_edit_mode) {
       if (IsKeyPressed(KEY_SPACE)) toggle_transport();
       if (IsKeyPressed(KEY_F) && !command_down()) toggle_focus();
+      nudge_selected_step_from_keys();
       if (command_down() && IsKeyPressed(KEY_S)) {
         pending_file_action = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT) ? FILE_ACTION_SAVE_AS : FILE_ACTION_SAVE;
       }
