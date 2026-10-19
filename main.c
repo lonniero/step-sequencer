@@ -27,23 +27,24 @@
 #define CHAIN_MAX_REPEATS   16
 
 #define WINDOW_WIDTH  800
-#define WINDOW_HEIGHT 582
+#define WINDOW_HEIGHT 618
 #define MARGIN        20
 #define HEADER_HEIGHT 36
 #define TOOLBAR_Y     52
-#define LABELS_Y      98
+#define TOOLBAR2_Y    88
+#define LABELS_Y      134
 #define NUMBER_WIDTH  28
 #define GRID_X        330
-#define GRID_Y        120
+#define GRID_Y        156
 #define GRID_WIDTH    450
 #define GRID_GAP      2
 #define ROW_HEIGHT    38
 #define CELL_HEIGHT   28
-#define STEP_LABELS_Y 428
-#define STEP_Y        450
-#define PATTERN_LABELS_Y 490
-#define PATTERN_Y     512
-#define FOOTER_Y      552
+#define STEP_LABELS_Y 464
+#define STEP_Y        486
+#define PATTERN_LABELS_Y 526
+#define PATTERN_Y     548
+#define FOOTER_Y      588
 
 #define PATTERN_BUTTON_WIDTH 23
 #define PATTERN_BUTTON_STEP  26
@@ -201,6 +202,36 @@ void
 clear_voices (unsigned int first, unsigned int count) {
   for (unsigned int i = 0; i < count; i++) {
     voices[first + i].sequence = 0;
+  }
+}
+
+// Rotates a voice by one of its own steps, so tracks of any length stay on their grid;
+// steps pushed off one end come back in at the other, with their step data.
+void
+rotate_voice (Voice *voice, int direction) {
+  unsigned int n = voice->steps;
+  Step *data = &steps[voice->id * MAX_STEPS];
+  Step rotated[MAX_STEPS];
+  uint64_t sequence = 0;
+  for (unsigned int j = 0; j < n; j++) {
+    unsigned int to = (j + n + direction) % n;
+    if (bit_by_position(voice->sequence, j)) sequence |= (uint64_t) 1 << to;
+    rotated[to] = data[j];
+  }
+  voice->sequence = sequence;
+  memcpy(data, rotated, n * sizeof *data);
+}
+
+// The selected step moves with its voice so the edit panel keeps pointing at the same note.
+void
+rotate_voices (unsigned int first, unsigned int count, int direction) {
+  for (unsigned int i = 0; i < count; i++) {
+    Voice *voice = &voices[first + i];
+    rotate_voice(voice, direction);
+    unsigned int step = selected_step % MAX_STEPS;
+    if ((unsigned int) selected_step / MAX_STEPS == voice->id && step < voice->steps) {
+      selected_step = voice->id * MAX_STEPS + (step + voice->steps + direction) % voice->steps;
+    }
   }
 }
 
@@ -963,6 +994,12 @@ render_toolbar (void) {
       clear_voices(0, VOICES_LENGTH);
     }
   }
+
+  // Shift moves every voice in view, including the focus voices behind each main view track.
+  unsigned int first = focused_track >= 0 ? track_voice(focused_track, 0)->id : 0;
+  unsigned int count = focused_track >= 0 ? VOICES_PER_TRACK : VOICES_LENGTH;
+  if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 165, TOOLBAR2_Y, 80, CELL_HEIGHT}, "< SHIFT")) rotate_voices(first, count, -1);
+  if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 80, TOOLBAR2_Y, 80, CELL_HEIGHT}, "SHIFT >")) rotate_voices(first, count, 1);
 }
 
 // Row number: click mutes, cmd-click solos, opt-click opens (main view) or closes (focus view) focus.
@@ -1142,6 +1179,9 @@ render_step (void) {
   if (mouse_over_grid()) hint = "CLICK/DRAG: PAINT STEPS  CMD+CLICK: SELECT STEP TO EDIT BELOW";
   if (GetMousePosition().y < HEADER_HEIGHT) hint = "CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
   Vector2 mouse = GetMousePosition();
+  if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= WINDOW_WIDTH - MARGIN - 165) {
+    hint = "MOVE EVERY TRACK ONE OF ITS OWN STEPS, WRAPPING AROUND THE BAR";
+  }
   if (mouse.y >= PATTERN_Y && mouse.y < PATTERN_Y + CELL_HEIGHT) {
     if (mouse.x < COPY_BUTTON_X) hint = "CLICK: SWITCH  SHIFT+CLICK: ADD TO CHAIN  OPT+CLICK: COPY CURRENT HERE";
     else if (mouse.x < CHAIN_BUTTON_X) hint = "COPY, THEN CLICK THE PATTERN TO COPY INTO";
