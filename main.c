@@ -27,7 +27,7 @@
 #define CHAIN_MAX_REPEATS   16
 
 #define WINDOW_WIDTH  800
-#define WINDOW_HEIGHT 618
+#define WINDOW_HEIGHT 680
 #define MARGIN        20
 #define HEADER_HEIGHT 36
 #define TOOLBAR_Y     52
@@ -42,9 +42,11 @@
 #define CELL_HEIGHT   28
 #define STEP_LABELS_Y 464
 #define STEP_Y        486
-#define PATTERN_LABELS_Y 526
-#define PATTERN_Y     548
-#define FOOTER_Y      588
+#define PITCH_LABELS_Y 526
+#define PITCH_Y       548
+#define PATTERN_LABELS_Y 588
+#define PATTERN_Y     610
+#define FOOTER_Y      650
 
 #define PATTERN_BUTTON_WIDTH 23
 #define PATTERN_BUTTON_STEP  26
@@ -52,6 +54,9 @@
 #define CHAIN_BUTTON_X       281
 #define STRIP_BUTTON_WIDTH   44
 #define CHAIN_BAR_WIDTH      40
+#define SCALE_TYPE_WIDTH     250
+#define APPLY_BUTTON_X       460
+#define TRANSPOSE_X          592
 
 #define PAPER      (Color){232, 230, 223, 255}
 #define PAPER_DARK (Color){214, 211, 202, 255}
@@ -142,6 +147,50 @@ unsigned int chain_position = 0;
 unsigned int chain_bar = 0;     // bars already played of the current chain entry
 bool chain_restart = false;     // start the chain from the top at the next loop boundary
 
+typedef struct Scale {
+  const char *name;
+  uint16_t mask; // bit n is set when the note n semitones above the root is in the scale
+} Scale;
+
+const Scale scales[] = {
+    {"MAJOR", 0xAB5},                     // 0 2 4 5 7 9 11
+    {"MINOR", 0x5AD},                     // 0 2 3 5 7 8 10
+    {"DORIAN", 0x6AD},                    // 0 2 3 5 7 9 10
+    {"PHRYGIAN", 0x5AB},                  // 0 1 3 5 7 8 10
+    {"LYDIAN", 0xAD5},                    // 0 2 4 6 7 9 11
+    {"MIXOLYDIAN", 0x6B5},                // 0 2 4 5 7 9 10
+    {"LOCRIAN", 0x56B},                   // 0 1 3 5 6 8 10
+    {"HARMONIC MINOR", 0x9AD},            // 0 2 3 5 7 8 11
+    {"MELODIC MINOR", 0xAAD},             // 0 2 3 5 7 9 11
+    {"MAJOR PENTATONIC", 0x295},          // 0 2 4 7 9
+    {"MINOR PENTATONIC", 0x4A9},          // 0 3 5 7 10
+    {"BLUES", 0x4E9},                     // 0 3 5 6 7 10
+    {"ROMANIAN MINOR", 0x6CD},            // 0 2 3 6 7 9 10
+    {"HUNGARIAN MINOR", 0x9CD},           // 0 2 3 6 7 8 11
+    {"GYPSY", 0x5CD},                     // 0 2 3 6 7 8 10
+    {"ARABIC (DOUBLE HARMONIC)", 0x9B3},  // 0 1 4 5 7 8 11
+    {"HIJAZ (PHRYGIAN DOMINANT)", 0x5B3}, // 0 1 4 5 7 8 10
+    {"PERSIAN", 0x973},                   // 0 1 4 5 6 8 11
+    {"SPANISH 8-TONE", 0x57B},            // 0 1 3 4 5 6 8 10
+    {"NEAPOLITAN MINOR", 0x9AB},          // 0 1 3 5 7 8 11
+    {"EGYPTIAN", 0x4A5},                  // 0 2 5 7 10
+    {"HIRAJOSHI", 0x18D},                 // 0 2 3 7 8
+    {"IN SEN", 0x4A3},                    // 0 1 5 7 10
+    {"IWATO", 0x463},                     // 0 1 5 6 10
+    {"PELOG", 0x18B},                     // 0 1 3 7 8
+    {"ENIGMATIC", 0xD53},                 // 0 1 4 6 8 10 11
+    {"PROMETHEUS", 0x655},                // 0 2 4 6 9 10
+    {"WHOLE TONE", 0x555},                // 0 2 4 6 8 10
+    {"DIMINISHED", 0xB6D},                // 0 2 3 5 6 8 9 11
+};
+#define SCALES_LENGTH (int) (sizeof scales / sizeof scales[0])
+
+// While a scale is on, note edits and transposing move between scale notes and
+// every step plays quantized to the scale. Turning it off plays the notes as written.
+bool scale_on = false;
+int scale_root = 0; // pitch class, 0 = C
+int scale_type = 0;
+
 uint64_t
 rand_u64 (void) {
   uint64_t r;
@@ -188,6 +237,39 @@ voice_audible_in_track (const Voice *voice) {
 bool
 voice_audible (const Voice *voice) {
   return track_audible(voice_track(voice)) && voice_audible_in_track(voice);
+}
+
+bool
+note_in_scale (int note) {
+  int interval = ((note - scale_root) % 12 + 12) % 12;
+  return scales[scale_type].mask >> interval & 1;
+}
+
+// The nearest scale note strictly above (direction 1) or below (-1), or -1 outside the MIDI range.
+int
+scale_neighbor (int note, int direction) {
+  for (int n = note + direction; n >= 0 && n <= 127; n += direction) {
+    if (note_in_scale(n)) return n;
+  }
+  return -1;
+}
+
+// What a step actually plays: the nearest scale note while a scale is on, the lower one on a tie.
+int
+quantize_note (int note) {
+  if (!scale_on || note_in_scale(note)) return note;
+  for (int d = 1; d < 12; d++) {
+    if (note - d >= 0 && note_in_scale(note - d)) return note - d;
+    if (note + d <= 127 && note_in_scale(note + d)) return note + d;
+  }
+  return note;
+}
+
+// One spinner click on a note: a semitone, or the next scale note that way while a scale is on.
+int
+step_note (int from, int to) {
+  if (!scale_on || to == from) return to;
+  return scale_neighbor(from, to > from ? 1 : -1);
 }
 
 void
@@ -284,7 +366,7 @@ run_step (Voice *voice) {
   if (bit_by_position(voice->sequence, voice->current_step) && voice_audible(voice)) {
     signed int detune = steps[(voice->id * MAX_STEPS) + voice->current_step].detune;
     unsigned int velocity = steps[(voice->id * MAX_STEPS) + voice->current_step].velocity;
-    voice->playing_note = voice->midi_note + detune;
+    voice->playing_note = quantize_note(voice->midi_note + detune);
     voice->playing_channel = voice_track(voice)->midi_channel;
     send_midi_note_on(midi_output_stream, voice->playing_channel - 1, voice->playing_note, velocity);
     voice->playing = true;
@@ -328,6 +410,37 @@ set_voice_note (Voice *voice, unsigned int note) {
   voice->note_edited = true;
 }
 
+// Moves voices by semitones, or by scale notes while a scale is on; octaves are 12 semitones
+// either way. Does nothing if any voice would leave the MIDI range, so chords keep their shape.
+void
+transpose_voices (unsigned int first, unsigned int count, unsigned int stride, int amount) {
+  int notes[VOICES_LENGTH];
+  for (unsigned int i = 0; i < count; i++) {
+    int note = voices[first + i * stride].midi_note;
+    note = scale_on && abs(amount) == 1 ? scale_neighbor(note, amount) : note + amount;
+    if (note < 0 || note > 127) return;
+    notes[i] = note;
+  }
+  for (unsigned int i = 0; i < count; i++) {
+    Voice *voice = &voices[first + i * stride];
+    release_voice(voice);
+    voice->midi_note = notes[i];
+  }
+}
+
+// Sets the rows in view to the scale going up from the root, in the first row's octave, and turns the scale on.
+void
+apply_scale (unsigned int first, unsigned int count, unsigned int stride) {
+  scale_on = true;
+  int note = voices[first].midi_note / 12 * 12 + scale_root;
+  if (note > 127) note -= 12;
+  for (unsigned int i = 0; i < count; i++) {
+    set_voice_note(&voices[first + i * stride], note);
+    int next = scale_neighbor(note, 1);
+    if (next >= 0) note = next;
+  }
+}
+
 void
 set_track_channel (Track *track, unsigned int channel) {
   for (size_t i = 0; i < VOICES_PER_TRACK; i++) release_voice(track_voice(track->id, i));
@@ -342,12 +455,14 @@ toggle_audibility_flag (bool *flag) {
 
 void
 open_focus (unsigned int track) {
+  // Untouched voices climb from the track note in semitones, or in scale notes while a scale is on.
   Voice *root = track_voice(track, 0);
+  int note = root->midi_note;
   for (unsigned int i = 1; i < VOICES_PER_TRACK; i++) {
+    int next = scale_on ? scale_neighbor(note, 1) : note + 1;
+    if (next >= 0 && next <= 127) note = next;
     Voice *voice = track_voice(track, i);
-    if (voice->note_edited) continue;
-    unsigned int note = root->midi_note + i;
-    voice->midi_note = note > 127 ? 127 : note;
+    if (!voice->note_edited) voice->midi_note = note;
   }
   focused_track = track;
   selected_step = root->id * MAX_STEPS + selected_step % MAX_STEPS;
@@ -736,6 +851,7 @@ write_project (const char *path) {
   fprintf(file, "bpm %d\n", (int) bpm);
   fprintf(file, "current_pattern %d\n", current_pattern);
   fprintf(file, "chain_mode %d\n", chain_mode);
+  fprintf(file, "scale %d %d %d\n", scale_on, scale_root, scale_type);
   if (project_path[0]) fprintf(file, "project_path %s\n", project_path);
   if (dropdown_active > 0) fprintf(file, "output %s\n", midi_output_devices[dropdown_active - 1].name);
   for (size_t i = 0; i < TRACKS_LENGTH; i++) {
@@ -781,6 +897,9 @@ reset_project (void) {
   chain_restart = false;
   focused_track = -1;
   selected_step = 0;
+  scale_on = false;
+  scale_root = 0;
+  scale_type = 0;
 }
 
 void
@@ -826,6 +945,12 @@ read_project (const char *path, bool restore_session) {
       if (a < PATTERNS_LENGTH) current_pattern = a;
     } else if (sscanf(line, "chain_mode %u", &a) == 1) {
       chain_mode = a;
+    } else if (sscanf(line, "scale %u %u %u", &a, &b, &c) == 3) {
+      if (b < 12 && (int) c < SCALES_LENGTH) {
+        scale_on = a;
+        scale_root = b;
+        scale_type = c;
+      }
     } else if (strncmp(line, "project_path ", 13) == 0) {
       if (restore_session) snprintf(project_path, sizeof project_path, "%s", line + 13);
     } else if (strncmp(line, "output ", 7) == 0) {
@@ -1106,14 +1231,15 @@ render_row (Voice *voice, unsigned int row) {
   }
   DrawText(TextFormat("%02d", row + 1), number_bounds.x + 3, y + 4, 20, soloed ? ACCENT : audible ? INK : PAPER);
 
-  DrawText(note_name(voice->midi_note), 52, y + 9, 10, MUTED);
+  DrawText(note_name(quantize_note(voice->midi_note)), 52, y + 9, 10, MUTED);
   unsigned int extra = focused_track >= 0 ? 0 : extra_voices_in_use(track->id);
   if (extra) DrawText(TextFormat("+%u", extra), 52, y + 20, 10, ACCENT);
 
   if (show_note_column()) {
     int note = voice->midi_note;
     GuiSpinner((Rectangle){90, y, 100, CELL_HEIGHT}, NULL, &note, 0, 127, false);
-    if (note != (int) voice->midi_note) set_voice_note(voice, note);
+    note = step_note(voice->midi_note, note);
+    if (note >= 0 && note != (int) voice->midi_note) set_voice_note(voice, note);
   } else {
     int channel = track->midi_channel;
     GuiSpinner((Rectangle){90, y, 100, CELL_HEIGHT}, NULL, &channel, 1, MIDI_CHANNELS, false);
@@ -1164,11 +1290,14 @@ render_step (void) {
   DrawRectangle(MARGIN, STEP_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, rule_color());
 
   DrawText(TextFormat("%02d", selected_step % MAX_STEPS + 1), MARGIN, STEP_Y + 4, 20, INK);
-  DrawText(note_name(voice->midi_note + step->detune), 52, STEP_Y + 9, 10, MUTED);
+  DrawText(note_name(quantize_note(voice->midi_note + step->detune)), 52, STEP_Y + 9, 10, MUTED);
 
+  // While a scale is on, detune clicks move the played note to the next scale note.
   int detune = step->detune;
   GuiSpinner((Rectangle){90, STEP_Y, 100, CELL_HEIGHT}, NULL, &detune, -36, 36, false);
-  if (detune != step->detune) step->detune = detune;
+  int played = step_note(voice->midi_note + step->detune, voice->midi_note + detune);
+  detune = played - (int) voice->midi_note;
+  if (played >= 0 && detune >= -36 && detune <= 36) step->detune = detune;
 
   int velocity = step->velocity;
   GuiSpinner((Rectangle){200, STEP_Y, 100, CELL_HEIGHT}, NULL, &velocity, 1, 127, false);
@@ -1187,6 +1316,12 @@ render_step (void) {
     else if (mouse.x < CHAIN_BUTTON_X) hint = "COPY, THEN CLICK THE PATTERN TO COPY INTO";
     else if (mouse.x < GRID_X) hint = "CLICK: PLAY THE CHAIN INSTEAD OF ONE PATTERN";
     else hint = "CLICK: +1 BAR  SHIFT+CLICK: -1 BAR  OPT+CLICK: REMOVE";
+  }
+  if (mouse.y >= PITCH_Y && mouse.y < PITCH_Y + CELL_HEIGHT) {
+    if (mouse.x < 90) hint = "SCALE ON: NOTE EDITS AND TRANSPOSE STAY IN THE SCALE, STEPS PLAY QUANTIZED";
+    else if (mouse.x < APPLY_BUTTON_X) hint = "PICK A ROOT AND SCALE, THEN APPLY";
+    else if (mouse.x < TRANSPOSE_X) hint = "SET THE ROWS TO THE SCALE, GOING UP FROM THE ROOT";
+    else hint = focused_track >= 0 ? "TRANSPOSE THIS TRACK'S VOICES" : "TRANSPOSE EVERY TRACK";
   }
   if (copy_mode) hint = TextFormat("CLICK A PATTERN TO COPY %c INTO IT  (COPY AGAIN TO CANCEL)", 'A' + current_pattern);
   DrawText(hint, WINDOW_WIDTH - MARGIN - MeasureText(hint, 10), STEP_Y + 9, 10, MUTED);
@@ -1326,6 +1461,53 @@ render_patterns (void) {
   render_chain();
 }
 
+// A value between arrow buttons, laid out like a spinner. Returns -1, 0 or 1.
+int
+selector (Rectangle bounds, const char *label) {
+  float button = 24;
+  bool previous = GuiButton((Rectangle){bounds.x, bounds.y, button, bounds.height}, GuiIconText(ICON_ARROW_LEFT_FILL, NULL));
+  bool next = GuiButton((Rectangle){bounds.x + bounds.width - button, bounds.y, button, bounds.height}, GuiIconText(ICON_ARROW_RIGHT_FILL, NULL));
+  Rectangle value = {bounds.x + button + 2, bounds.y, bounds.width - 2 * button - 4, bounds.height};
+  DrawRectangleLinesEx(value, 1, INK);
+  draw_centered_text(label, value, INK);
+  return next - previous;
+}
+
+void
+render_pitch (void) {
+  static const char *roots[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+
+  DrawText("SCALE", MARGIN, PITCH_LABELS_Y, 10, MUTED);
+  DrawText("ROOT", 90, PITCH_LABELS_Y, 10, MUTED);
+  DrawText("TYPE", 200, PITCH_LABELS_Y, 10, MUTED);
+  DrawText(scale_on ? "TRANSPOSE IN SCALE" : "TRANSPOSE", TRANSPOSE_X, PITCH_LABELS_Y, 10, MUTED);
+  DrawRectangle(MARGIN, PITCH_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, rule_color());
+
+  Rectangle toggle = {MARGIN, PITCH_Y, 60, CELL_HEIGHT};
+  if (clicked(toggle)) scale_on = !scale_on;
+  DrawRectangleRec(toggle, scale_on ? ACCENT : background_color());
+  DrawRectangleLinesEx(toggle, 1, INK);
+  draw_centered_text(scale_on ? "ON" : "OFF", toggle, INK);
+
+  scale_root = (scale_root + 12 + selector((Rectangle){90, PITCH_Y, 100, CELL_HEIGHT}, roots[scale_root])) % 12;
+  scale_type = (scale_type + SCALES_LENGTH + selector((Rectangle){200, PITCH_Y, SCALE_TYPE_WIDTH, CELL_HEIGHT}, scales[scale_type].name)) % SCALES_LENGTH;
+
+  // In the main view these act on the tracks: apply sets each track's note, transpose moves every voice.
+  bool focus = focused_track >= 0;
+  unsigned int root = focus ? track_voice(focused_track, 0)->id : 0;
+  if (GuiButton((Rectangle){APPLY_BUTTON_X, PITCH_Y, 80, CELL_HEIGHT}, "APPLY")) {
+    apply_scale(root, TRACKS_LENGTH, focus ? 1 : VOICES_PER_TRACK);
+  }
+
+  static const char *labels[] = {"-OCT", "-1", "+1", "+OCT"};
+  static const int amounts[] = {-12, -1, 1, 12};
+  for (int i = 0; i < 4; i++) {
+    if (GuiButton((Rectangle){TRANSPOSE_X + i * 48, PITCH_Y, 44, CELL_HEIGHT}, labels[i])) {
+      transpose_voices(root, focus ? VOICES_PER_TRACK : VOICES_LENGTH, 1, amounts[i]);
+    }
+  }
+}
+
 void
 render_tracks (void) {
   DrawText(focused_track >= 0 ? "VOICE" : "NO", MARGIN, LABELS_Y, 10, MUTED);
@@ -1403,6 +1585,7 @@ main (void) {
     if (dropdown_edit_mode) GuiLock();
     render_toolbar();
     render_patterns();
+    render_pitch();
     render_tracks();
     render_step();
     GuiUnlock();
