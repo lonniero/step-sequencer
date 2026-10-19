@@ -60,7 +60,8 @@
 #define PATTERN_LABELS_Y (526 + pitch_height())
 #define PATTERN_Y     (548 + pitch_height())
 #define PATTERN_HEIGHT 62
-#define FOOTER_Y      (588 + pitch_height() - (chain_visible ? 0 : PATTERN_HEIGHT))
+#define FOOTER_Y      (526 + pitch_height() + pattern_height())
+#define SLIDE_SECONDS 0.18f // how long a section takes to slide open or closed
 
 #define PATTERN_BUTTON_WIDTH 23
 #define PATTERN_BUTTON_STEP  26
@@ -168,11 +169,30 @@ bool clock_dropdown_edit_mode = false;
 int selected_step = 0;
 int focused_track = -1; // -1 shows all tracks, otherwise the voices of this track
 
-// The pitch section only shows in focus view, pushing the patterns and footer down.
-// The window fits whichever sections are showing.
+// The pitch section only shows in focus view and the pattern section only when the chain is
+// shown. Each slides open and closed: its reveal runs from 0 (hidden) to 1 (shown), and the
+// sections below it and the window follow its eased height.
+float pitch_reveal = 0;
+float pattern_reveal = 0;
+
+int
+eased_height (float reveal, int height) {
+  return roundf(reveal * reveal * (3 - 2 * reveal) * height);
+}
+
 int
 pitch_height (void) {
-  return focused_track >= 0 ? PITCH_HEIGHT : 0;
+  return eased_height(pitch_reveal, PITCH_HEIGHT);
+}
+
+int
+pattern_height (void) {
+  return eased_height(pattern_reveal, PATTERN_HEIGHT);
+}
+
+int
+window_height (void) {
+  return WINDOW_HEIGHT - PATTERN_HEIGHT + pitch_height() + pattern_height();
 }
 
 // All guarded by lock: tick switches patterns at the loop boundary.
@@ -186,11 +206,18 @@ bool copy_mode = false; // next pattern click copies the current pattern there
 unsigned int chain_position = 0;
 unsigned int chain_bar = 0;     // bars already played of the current chain entry
 bool chain_restart = false;     // start the chain from the top at the next loop boundary
-bool chain_visible = true;      // the pattern and chain section; hiding it keeps a running chain playing
+bool chain_visible = false;     // the pattern and chain section, closed at launch; hiding it keeps a running chain playing
 
-int
-window_height (void) {
-  return WINDOW_HEIGHT + pitch_height() - (chain_visible ? 0 : PATTERN_HEIGHT);
+void
+slide_towards (float *reveal, bool shown, float dt) {
+  float step = dt / SLIDE_SECONDS;
+  *reveal = shown ? fminf(*reveal + step, 1) : fmaxf(*reveal - step, 0);
+}
+
+void
+slide_sections (float dt) {
+  slide_towards(&pitch_reveal, focused_track >= 0, dt);
+  slide_towards(&pattern_reveal, chain_visible, dt);
 }
 
 typedef struct Scale {
@@ -1107,7 +1134,6 @@ write_project (const char *path) {
   fprintf(file, "metronome %d\n", metronome_on);
   fprintf(file, "current_pattern %d\n", current_pattern);
   fprintf(file, "chain_mode %d\n", chain_mode);
-  fprintf(file, "chain_visible %d\n", chain_visible);
   if (project_path[0]) fprintf(file, "project_path %s\n", project_path);
   if (dropdown_active > 0) fprintf(file, "output %s\n", midi_output_devices[dropdown_active - 1].name);
   if (clock_input_name[0]) fprintf(file, "clock_input %s\n", clock_input_name);
@@ -1278,8 +1304,6 @@ read_project (const char *path, bool restore_session) {
       if (n >= MIN_SWING && n <= MAX_SWING) swing = n;
     } else if (sscanf(line, "current_pattern %u", &a) == 1) {
       if (a < PATTERNS_LENGTH) current_pattern = a;
-    } else if (sscanf(line, "chain_visible %u", &a) == 1) {
-      chain_visible = a;
     } else if (sscanf(line, "chain_mode %u", &a) == 1) {
       chain_mode = a;
     } else if (sscanf(line, "track_scale %u %u %u %u", &a, &b, &c, &d) == 4) {
@@ -1760,7 +1784,7 @@ render_step (void) {
   if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= WINDOW_WIDTH - MARGIN - 165) {
     hint = "MOVE EVERY TRACK ONE OF ITS OWN STEPS, WRAPPING AROUND THE BAR";
   }
-  if (chain_visible && mouse.y >= PATTERN_Y && mouse.y < PATTERN_Y + CELL_HEIGHT) {
+  if (pattern_reveal == 1 && mouse.y >= PATTERN_Y && mouse.y < PATTERN_Y + CELL_HEIGHT) {
     if (mouse.x < COPY_BUTTON_X) hint = "CLICK: SWITCH  SHIFT+CLICK: ADD TO CHAIN  OPT+CLICK: COPY CURRENT HERE";
     else if (mouse.x < CHAIN_BUTTON_X) hint = "COPY, THEN CLICK THE PATTERN TO COPY INTO";
     else if (mouse.x < GRID_X) hint = "CLICK: PLAY THE CHAIN INSTEAD OF ONE PATTERN";
@@ -1974,6 +1998,27 @@ render_footer (void) {
   if (GetTime() < status_until) DrawText(status_message, 300, FOOTER_Y + 10, 10, ACCENT);
 }
 
+// A section drawn while sliding is cut off by the next one down, which paints over it, and
+// does not take clicks until it is fully open.
+void
+render_sliding_section (void (*render)(void), float reveal, int top) {
+  if (reveal == 0) return;
+  DrawRectangle(0, top, WINDOW_WIDTH, WINDOW_HEIGHT, background_color());
+  if (!render) return; // a section closing after its content went away slides shut empty
+  bool locked = GuiIsLocked();
+  if (reveal < 1) GuiLock();
+  render();
+  if (!locked) GuiUnlock();
+}
+
+void
+render_sections (void) {
+  render_sliding_section(focused_track >= 0 ? render_pitch : NULL, pitch_reveal, PITCH_LABELS_Y - 6);
+  render_sliding_section(render_patterns, pattern_reveal, PATTERN_LABELS_Y - 6);
+  DrawRectangle(0, FOOTER_Y - 4, WINDOW_WIDTH, WINDOW_HEIGHT, background_color());
+  render_footer();
+}
+
 int
 main (void) {
   Pm_Initialize();
@@ -2007,10 +2052,15 @@ main (void) {
   pthread_mutex_unlock(&lock);
 
   while (!WindowShouldClose()) {
+    // Resize between frames, so no frame is drawn at one size and shown at another.
+    pthread_mutex_lock(&lock);
+    slide_sections(GetFrameTime());
+    if (GetScreenHeight() != window_height()) SetWindowSize(WINDOW_WIDTH, window_height());
+    pthread_mutex_unlock(&lock);
+
     BeginDrawing();
     pthread_mutex_lock(&lock);
 
-    if (GetScreenHeight() != window_height()) SetWindowSize(WINDOW_WIDTH, window_height());
     ClearBackground(background_color());
     apply_style(false);
 
@@ -2031,13 +2081,11 @@ main (void) {
     }
 
     render_header();
-    render_footer();
     if (dropdown_open) GuiLock();
     render_toolbar();
-    if (chain_visible) render_patterns();
-    if (focused_track >= 0) render_pitch();
     render_tracks();
     render_step();
+    render_sections();
     GuiUnlock();
     render_dropdowns();
     end_paint_frame();
