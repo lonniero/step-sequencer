@@ -21,6 +21,8 @@
 #define MAX_STEPS           32
 #define MIN_BPM             40
 #define MAX_BPM             240
+#define MIN_SWING           50
+#define MAX_SWING           75
 #define MIDI_CHANNELS       16
 #define PATTERNS_LENGTH     8
 #define CHAIN_MAX_LENGTH    16
@@ -86,7 +88,9 @@ typedef struct Voice {
   unsigned int id; // global index, track = id / VOICES_PER_TRACK
   unsigned int steps;
   unsigned int midi_note;
-  unsigned int current_step;
+  unsigned int current_step; // step under the playhead
+  uint64_t passed;           // steps whose time has come this loop, played or not
+  double release_at;         // Pt time the sounding note ends
   uint64_t sequence;
   bool playing;
   unsigned int playing_note;    // note and channel of the sounding note, so note off matches it
@@ -124,6 +128,7 @@ typedef struct ChainEntry {
 } ChainEntry;
 
 double bpm = 120.0; // guarded by lock
+int swing = 50;     // guarded by lock; percent of an 8th where the second 16th lands, 50 is straight
 const int beats_per_loop = 4;
 bool running = true;            // guarded by lock; once false, tick never touches MIDI again
 bool transport_playing = false; // guarded by lock; play/stop state
@@ -374,32 +379,74 @@ choke_others (const Track *track) {
   }
 }
 
-void
-run_step (Voice *voice) {
-  release_voice(voice);
-  if (bit_by_position(voice->sequence, voice->current_step) && voice_audible(voice)) {
-    signed int detune = steps[(voice->id * MAX_STEPS) + voice->current_step].detune;
-    unsigned int velocity = steps[(voice->id * MAX_STEPS) + voice->current_step].velocity;
-    voice->playing_note = quantize_note(voice->midi_note + detune);
-    voice->playing_channel = voice_track(voice)->midi_channel;
-    choke_others(voice_track(voice));
-    send_midi_note_on(midi_output_stream, voice->playing_channel - 1, voice->playing_note, velocity);
-    voice->playing = true;
-  }
-  voice->current_step++;
-}
-
-void
-sync_voices (void) {
-  for (size_t i = 0; i < VOICES_LENGTH; i++) {
-    voices[i].current_step = 0;
-    run_step(&voices[i]);
-  }
-}
-
 double
 loop_length_ms (void) {
   return beats_per_loop * 60000.0 / bpm;
+}
+
+// Swing pushes the second 16th of every 8th late. It warps time within the bar rather than
+// step numbers, so tracks of any length swing against the same feel. Straight to swung time:
+double
+swing_time (double t) {
+  double eighth = loop_length_ms() / (beats_per_loop * 2);
+  double start = floor(t / eighth) * eighth;
+  double u = (t - start) / eighth;
+  double s = swing / 100.0;
+  return start + eighth * (u < 0.5 ? 2 * s * u : s + 2 * (1 - s) * (u - 0.5));
+}
+
+// Swung back to straight time, to place the playhead.
+double
+unswing_time (double t) {
+  double eighth = loop_length_ms() / (beats_per_loop * 2);
+  double start = floor(t / eighth) * eighth;
+  double w = (t - start) / eighth;
+  double s = swing / 100.0;
+  return start + eighth * (w < s ? w / (2 * s) : 0.5 + (w - s) / (2 * (1 - s)));
+}
+
+// When a step starts, in ms since the loop started. Step `steps` is the end of the loop.
+double
+step_time (const Voice *voice, unsigned int step) {
+  return swing_time(step * loop_length_ms() / voice->steps);
+}
+
+// Sends a step's note, held until the next step starts.
+void
+play_step (Voice *voice, unsigned int step, double loop_start) {
+  if (!bit_by_position(voice->sequence, step) || !voice_audible(voice)) return;
+  release_voice(voice);
+  const Step *data = &steps[voice->id * MAX_STEPS + step];
+  voice->playing_note = quantize_note(voice->midi_note + data->detune);
+  voice->playing_channel = voice_track(voice)->midi_channel;
+  choke_others(voice_track(voice));
+  send_midi_note_on(midi_output_stream, voice->playing_channel - 1, voice->playing_note, data->velocity);
+  voice->playing = true;
+  voice->release_at = loop_start + step_time(voice, step + 1);
+}
+
+// Plays every step whose time has come, given the time since the loop started.
+// Steps are marked passed whether they play or not, so steps toggled on behind the playhead wait for the next loop.
+void
+advance_voices (double now, double elapsed) {
+  double loop_ms = loop_length_ms();
+  for (size_t i = 0; i < VOICES_LENGTH; i++) {
+    Voice *voice = &voices[i];
+    if (voice->playing && now >= voice->release_at) release_voice(voice);
+    for (unsigned int j = 0; j < voice->steps; j++) {
+      uint64_t bit = (uint64_t) 1 << j;
+      if (voice->passed & bit || step_time(voice, j) > elapsed) continue;
+      voice->passed |= bit;
+      play_step(voice, j, loop.loop_start);
+    }
+    unsigned int step = unswing_time(elapsed) * voice->steps / loop_ms;
+    voice->current_step = step < voice->steps ? step : voice->steps - 1;
+  }
+}
+
+void
+start_loop (void) {
+  for (size_t i = 0; i < VOICES_LENGTH; i++) voices[i].passed = 0;
 }
 
 void
@@ -410,12 +457,16 @@ set_bpm (double new_bpm) {
   loop.loop_start = now - phase * loop_length_ms();
 }
 
+// Steps of the new length already behind the playhead wait for the next loop.
 void
 set_voice_steps (Voice *voice, unsigned int steps) {
-  double step_length = loop_length_ms() / steps;
-  unsigned int step = (Pt_Time() - loop.loop_start) / step_length;
   voice->steps = steps;
-  voice->current_step = step + 1;
+  voice->passed = 0;
+  if (!transport_playing) return;
+  double elapsed = Pt_Time() - loop.loop_start;
+  for (unsigned int j = 0; j < steps; j++) {
+    if (step_time(voice, j) <= elapsed) voice->passed |= (uint64_t) 1 << j;
+  }
 }
 
 void
@@ -635,7 +686,8 @@ play (void) {
   }
   loop.loop_start = Pt_Time();
   transport_playing = true;
-  sync_voices();
+  start_loop();
+  advance_voices(loop.loop_start, 0);
 }
 
 void
@@ -644,6 +696,7 @@ stop (void) {
   release_all_voices();
   for (size_t i = 0; i < VOICES_LENGTH; i++) {
     voices[i].current_step = 0;
+    voices[i].passed = 0;
   }
 }
 
@@ -661,21 +714,13 @@ tick (PtTimestamp now, void *user_data) {
   pthread_mutex_lock(&lock);
   if (running && transport_playing) {
     double loop_ms = loop_length_ms();
-    double elapsed = now - loop.loop_start;
-    if (elapsed >= loop_ms) {
+    if (now - loop.loop_start >= loop_ms) {
+      advance_voices(now, loop_ms); // anything still due in the loop that just ended
       loop.loop_start += loop_ms;
       advance_pattern();
-      sync_voices();
-    } else {
-      for (size_t i = 0; i < VOICES_LENGTH; i++) {
-        double step_length = loop_ms / (double) voices[i].steps;
-        int loop_current_step = elapsed / step_length;
-        if (voices[i].current_step <= loop_current_step) {
-          voices[i].current_step = loop_current_step;
-          run_step(&voices[i]);
-        }
-      }
+      start_loop();
     }
+    advance_voices(now, now - loop.loop_start);
   }
   pthread_mutex_unlock(&lock);
 }
@@ -864,6 +909,7 @@ write_project (const char *path) {
 
   fprintf(file, "%s %d\n", PROJECT_MAGIC, PROJECT_VERSION);
   fprintf(file, "bpm %d\n", (int) bpm);
+  fprintf(file, "swing %d\n", swing);
   fprintf(file, "current_pattern %d\n", current_pattern);
   fprintf(file, "chain_mode %d\n", chain_mode);
   fprintf(file, "scale %d %d %d\n", scale_on, scale_root, scale_type);
@@ -913,6 +959,7 @@ reset_project (void) {
   chain_restart = false;
   focused_track = -1;
   selected_step = 0;
+  swing = 50;
   scale_on = false;
   scale_root = 0;
   scale_type = 0;
@@ -957,6 +1004,8 @@ read_project (const char *path, bool restore_session) {
 
     if (sscanf(line, "bpm %d", &n) == 1) {
       if (n >= MIN_BPM && n <= MAX_BPM) bpm = n;
+    } else if (sscanf(line, "swing %d", &n) == 1) {
+      if (n >= MIN_SWING && n <= MAX_SWING) swing = n;
     } else if (sscanf(line, "current_pattern %u", &a) == 1) {
       if (a < PATTERNS_LENGTH) current_pattern = a;
     } else if (sscanf(line, "chain_mode %u", &a) == 1) {
@@ -1116,6 +1165,10 @@ render_header (void) {
 void
 render_toolbar (void) {
   if (GuiButton((Rectangle){210, TOOLBAR_Y, 80, CELL_HEIGHT}, transport_playing ? "STOP" : "PLAY")) toggle_transport();
+
+  float swing_value = swing;
+  GuiSliderBar((Rectangle){GRID_X, TOOLBAR2_Y, 150, CELL_HEIGHT}, "SWING", TextFormat("%d%%", swing), &swing_value, MIN_SWING, MAX_SWING);
+  swing = swing_value;
 
   float bpm_value = bpm;
   GuiSliderBar((Rectangle){GRID_X, TOOLBAR_Y, 150, CELL_HEIGHT}, "BPM", TextFormat("%03d", (int) bpm), &bpm_value, MIN_BPM, MAX_BPM);
@@ -1293,7 +1346,7 @@ render_row (Voice *voice, unsigned int row) {
     draw_centered_text(label, group, track->choke_group ? ACCENT : MUTED);
   }
 
-  unsigned int playing_step = (voice->current_step + voice->steps - 1) % voice->steps;
+  unsigned int playing_step = voice->current_step;
   for (unsigned int j = 0; j < voice->steps; j++) {
     int x0 = GRID_X + (j * GRID_WIDTH) / voice->steps;
     int x1 = GRID_X + ((j + 1) * GRID_WIDTH) / voice->steps;
