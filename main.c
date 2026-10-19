@@ -4,6 +4,7 @@
 #include <porttime.h>
 #include <pthread.h>
 #include <raygui.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <limits.h>
@@ -25,6 +26,8 @@
 #define MAX_SWING           75
 #define NUDGE_TICKS         24 // a nudge tick is 1/24 of a step
 #define MAX_NUDGE           12 // half a step either way
+#define CLICK_SAMPLE_RATE   44100
+#define CLICK_BUFFER_FRAMES 256 // small, so a click starts within about one audio device period (~10 ms) of its beat
 #define MIDI_CHANNELS       16
 #define PATTERNS_LENGTH     8
 #define CHAIN_MAX_LENGTH    16
@@ -136,6 +139,9 @@ int swing = 50;     // guarded by lock; percent of an 8th where the second 16th 
 const int beats_per_loop = 4;
 bool running = true;            // guarded by lock; once false, tick never touches MIDI again
 bool transport_playing = false; // guarded by lock; play/stop state
+bool metronome_on = false;      // guarded by lock
+unsigned int metronome_passed;  // guarded by lock; beats already clicked this loop
+atomic_int click_pending = 0;   // 1 click, 2 accented click; set by tick, taken by the audio thread
 
 Loop loop;
 Track tracks[TRACKS_LENGTH];
@@ -464,7 +470,35 @@ advance_voices (double now, double elapsed) {
 }
 
 void
+advance_metronome (double elapsed) {
+  for (int beat = 0; beat < beats_per_loop; beat++) {
+    if (metronome_passed >> beat & 1 || beat * loop_length_ms() / beats_per_loop > elapsed) continue;
+    metronome_passed |= 1 << beat;
+    if (metronome_on) atomic_store(&click_pending, beat == 0 ? 2 : 1);
+  }
+}
+
+// Audio thread: a short decaying sine blip, higher on the first beat of the bar.
+void
+render_click (void *buffer, unsigned int frames) {
+  static float phase = 0, frequency = 0, amplitude = 0;
+  int pending = atomic_exchange(&click_pending, 0);
+  if (pending) {
+    phase = 0;
+    frequency = pending == 2 ? 1760 : 1320;
+    amplitude = 0.5f;
+  }
+  float *out = buffer;
+  for (unsigned int i = 0; i < frames; i++) {
+    out[i] = amplitude * sinf(phase);
+    phase = fmodf(phase + 2 * PI * frequency / CLICK_SAMPLE_RATE, 2 * PI);
+    amplitude *= 0.9985f;
+  }
+}
+
+void
 start_loop (void) {
+  metronome_passed = 0;
   for (size_t i = 0; i < VOICES_LENGTH; i++) {
     voices[i].passed = voices[i].early_next;
     voices[i].early_next = false;
@@ -710,6 +744,7 @@ play (void) {
   transport_playing = true;
   start_loop();
   advance_voices(loop.loop_start, 0);
+  advance_metronome(0);
 }
 
 void
@@ -744,6 +779,7 @@ tick (PtTimestamp now, void *user_data) {
       start_loop();
     }
     advance_voices(now, now - loop.loop_start);
+    advance_metronome(now - loop.loop_start);
   }
   pthread_mutex_unlock(&lock);
 }
@@ -933,6 +969,7 @@ write_project (const char *path) {
   fprintf(file, "%s %d\n", PROJECT_MAGIC, PROJECT_VERSION);
   fprintf(file, "bpm %d\n", (int) bpm);
   fprintf(file, "swing %d\n", swing);
+  fprintf(file, "metronome %d\n", metronome_on);
   fprintf(file, "current_pattern %d\n", current_pattern);
   fprintf(file, "chain_mode %d\n", chain_mode);
   fprintf(file, "scale %d %d %d\n", scale_on, scale_root, scale_type);
@@ -985,6 +1022,7 @@ reset_project (void) {
   focused_track = -1;
   selected_step = 0;
   swing = 50;
+  metronome_on = false;
   scale_on = false;
   scale_root = 0;
   scale_type = 0;
@@ -1029,6 +1067,8 @@ read_project (const char *path, bool restore_session) {
 
     if (sscanf(line, "bpm %d", &n) == 1) {
       if (n >= MIN_BPM && n <= MAX_BPM) bpm = n;
+    } else if (sscanf(line, "metronome %u", &a) == 1) {
+      metronome_on = a;
     } else if (sscanf(line, "swing %d", &n) == 1) {
       if (n >= MIN_SWING && n <= MAX_SWING) swing = n;
     } else if (sscanf(line, "current_pattern %u", &a) == 1) {
@@ -1153,6 +1193,22 @@ run_file_action (FileAction action) {
 }
 
 bool
+clicked (Rectangle bounds) {
+  return !GuiIsLocked() && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), bounds);
+}
+
+bool
+shift_down (void) {
+  return IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+}
+
+void
+draw_centered_text (const char *text, Rectangle bounds, Color color) {
+  int width = MeasureText(text, 10);
+  DrawText(text, bounds.x + (bounds.width - width) / 2, bounds.y + (bounds.height - 10) / 2, 10, color);
+}
+
+bool
 header_button (Rectangle bounds, const char *label) {
   Color text = in_focus() ? INK : PAPER;
   bool hover = !GuiIsLocked() && CheckCollisionPointRec(GetMousePosition(), bounds);
@@ -1193,6 +1249,12 @@ void
 render_toolbar (void) {
   if (GuiButton((Rectangle){210, TOOLBAR_Y, 80, CELL_HEIGHT}, transport_playing ? "STOP" : "PLAY")) toggle_transport();
 
+  Rectangle metronome = {210, TOOLBAR2_Y, 80, CELL_HEIGHT};
+  if (clicked(metronome)) metronome_on = !metronome_on;
+  DrawRectangleRec(metronome, metronome_on ? ACCENT : background_color());
+  DrawRectangleLinesEx(metronome, 1, INK);
+  draw_centered_text("CLICK", metronome, INK);
+
   float swing_value = swing;
   GuiSliderBar((Rectangle){GRID_X, TOOLBAR2_Y, 150, CELL_HEIGHT}, "SWING", TextFormat("%d%%", swing), &swing_value, MIN_SWING, MAX_SWING);
   swing = swing_value;
@@ -1223,22 +1285,6 @@ render_toolbar (void) {
   unsigned int count = focused_track >= 0 ? VOICES_PER_TRACK : VOICES_LENGTH;
   if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 165, TOOLBAR2_Y, 80, CELL_HEIGHT}, "< SHIFT")) rotate_voices(first, count, -1);
   if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 80, TOOLBAR2_Y, 80, CELL_HEIGHT}, "SHIFT >")) rotate_voices(first, count, 1);
-}
-
-bool
-clicked (Rectangle bounds) {
-  return !GuiIsLocked() && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), bounds);
-}
-
-bool
-shift_down (void) {
-  return IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-}
-
-void
-draw_centered_text (const char *text, Rectangle bounds, Color color) {
-  int width = MeasureText(text, 10);
-  DrawText(text, bounds.x + (bounds.width - width) / 2, bounds.y + (bounds.height - 10) / 2, 10, color);
 }
 
 // Row number: click mutes, cmd-click solos, opt-click opens (main view) or closes (focus view) focus.
@@ -1451,6 +1497,9 @@ render_step (void) {
   if (mouse_over_grid()) hint = "CLICK/DRAG: PAINT STEPS  CMD+CLICK: SELECT STEP TO EDIT BELOW";
   if (mouse.y >= STEP_Y && mouse.y < STEP_Y + CELL_HEIGHT) hint = "LEFT/RIGHT ARROWS NUDGE THE SELECTED STEP";
   if (mouse.y < HEADER_HEIGHT) hint = "CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
+  if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= 210 && mouse.x < 290) {
+    hint = "METRONOME: A BUILT-IN CLICK, NOT SENT OVER MIDI";
+  }
   if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= WINDOW_WIDTH - MARGIN - 165) {
     hint = "MOVE EVERY TRACK ONE OF ITS OWN STEPS, WRAPPING AROUND THE BAR";
   }
@@ -1673,6 +1722,12 @@ main (void) {
   SetTargetFPS(60);
   Pm_Initialize();
 
+  InitAudioDevice();
+  SetAudioStreamBufferSizeDefault(CLICK_BUFFER_FRAMES);
+  AudioStream click = LoadAudioStream(CLICK_SAMPLE_RATE, 32, 1);
+  SetAudioStreamCallback(click, render_click);
+  PlayAudioStream(click);
+
   init_tracks();
   init_steps();
   init_patterns();
@@ -1739,6 +1794,8 @@ main (void) {
   Pt_Stop();
   close_midi_output_stream();
   Pm_Terminate();
+  UnloadAudioStream(click);
+  CloseAudioDevice();
   CloseWindow();
   return 0;
 }
