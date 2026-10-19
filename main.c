@@ -54,6 +54,9 @@
 #define CHAIN_BUTTON_X       281
 #define STRIP_BUTTON_WIDTH   44
 #define CHAIN_BAR_WIDTH      40
+#define CHOKE_X              296
+#define CHOKE_WIDTH          28
+#define CHOKE_GROUPS         4
 #define SCALE_TYPE_WIDTH     250
 #define APPLY_BUTTON_X       460
 #define TRANSPOSE_X          592
@@ -96,6 +99,7 @@ typedef struct Voice {
 typedef struct Track {
   unsigned int id;
   unsigned int midi_channel; // 1-16
+  unsigned int choke_group;  // 0 for none, otherwise 1-CHOKE_GROUPS
   bool muted;
   bool soloed;
 } Track;
@@ -360,6 +364,16 @@ release_inaudible_voices (void) {
   }
 }
 
+// Tracks in the same choke group cut each other off, like open and closed hi-hats.
+void
+choke_others (const Track *track) {
+  if (!track->choke_group) return;
+  for (size_t i = 0; i < TRACKS_LENGTH; i++) {
+    if (i == track->id || tracks[i].choke_group != track->choke_group) continue;
+    for (size_t j = 0; j < VOICES_PER_TRACK; j++) release_voice(track_voice(i, j));
+  }
+}
+
 void
 run_step (Voice *voice) {
   release_voice(voice);
@@ -368,6 +382,7 @@ run_step (Voice *voice) {
     unsigned int velocity = steps[(voice->id * MAX_STEPS) + voice->current_step].velocity;
     voice->playing_note = quantize_note(voice->midi_note + detune);
     voice->playing_channel = voice_track(voice)->midi_channel;
+    choke_others(voice_track(voice));
     send_midi_note_on(midi_output_stream, voice->playing_channel - 1, voice->playing_note, velocity);
     voice->playing = true;
   }
@@ -856,6 +871,7 @@ write_project (const char *path) {
   if (dropdown_active > 0) fprintf(file, "output %s\n", midi_output_devices[dropdown_active - 1].name);
   for (size_t i = 0; i < TRACKS_LENGTH; i++) {
     fprintf(file, "track %zu %u %d %d\n", i, tracks[i].midi_channel, tracks[i].muted, tracks[i].soloed);
+    if (tracks[i].choke_group) fprintf(file, "choke %zu %u\n", i, tracks[i].choke_group);
   }
   for (size_t i = 0; i < VOICES_LENGTH; i++) {
     const Voice *voice = &voices[i];
@@ -961,6 +977,8 @@ read_project (const char *path, bool restore_session) {
         tracks[a].muted = c;
         tracks[a].soloed = d;
       }
+    } else if (sscanf(line, "choke %u %u", &a, &b) == 2) {
+      if (a < TRACKS_LENGTH && b <= CHOKE_GROUPS) tracks[a].choke_group = b;
     } else if (sscanf(line, "voice %u %u %u %u %u", &a, &b, &c, &d, &e) == 5) {
       if (a < VOICES_LENGTH && b <= 127) {
         voices[a].midi_note = b;
@@ -1127,6 +1145,22 @@ render_toolbar (void) {
   if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 80, TOOLBAR2_Y, 80, CELL_HEIGHT}, "SHIFT >")) rotate_voices(first, count, 1);
 }
 
+bool
+clicked (Rectangle bounds) {
+  return !GuiIsLocked() && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), bounds);
+}
+
+bool
+shift_down (void) {
+  return IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+}
+
+void
+draw_centered_text (const char *text, Rectangle bounds, Color color) {
+  int width = MeasureText(text, 10);
+  DrawText(text, bounds.x + (bounds.width - width) / 2, bounds.y + (bounds.height - 10) / 2, 10, color);
+}
+
 // Row number: click mutes, cmd-click solos, opt-click opens (main view) or closes (focus view) focus.
 void
 handle_number_click (Rectangle bounds, bool *muted, bool *soloed, int focus_target) {
@@ -1247,8 +1281,17 @@ render_row (Voice *voice, unsigned int row) {
   }
 
   int steps = voice->steps;
-  GuiSpinner((Rectangle){200, y, 100, CELL_HEIGHT}, NULL, &steps, 1, MAX_STEPS, false);
+  GuiSpinner((Rectangle){200, y, 90, CELL_HEIGHT}, NULL, &steps, 1, MAX_STEPS, false);
   if (steps != (int) voice->steps) set_voice_steps(voice, steps);
+
+  // Choke group: click cycles none, A-D; shift-click goes back.
+  if (focused_track < 0) {
+    Rectangle group = {CHOKE_X, y, CHOKE_WIDTH, CELL_HEIGHT};
+    if (clicked(group)) track->choke_group = (track->choke_group + (shift_down() ? CHOKE_GROUPS : 1)) % (CHOKE_GROUPS + 1);
+    DrawRectangleLinesEx(group, 1, audible ? INK : PAPER);
+    const char *label = track->choke_group ? TextFormat("%c", 'A' + track->choke_group - 1) : "-";
+    draw_centered_text(label, group, track->choke_group ? ACCENT : MUTED);
+  }
 
   unsigned int playing_step = (voice->current_step + voice->steps - 1) % voice->steps;
   for (unsigned int j = 0; j < voice->steps; j++) {
@@ -1305,9 +1348,12 @@ render_step (void) {
 
   const char *hint = focused_track >= 0 ? "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: CLOSE  HOLD CMD: CH"
                                         : "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: FOCUS  HOLD CMD: NOTE";
-  if (mouse_over_grid()) hint = "CLICK/DRAG: PAINT STEPS  CMD+CLICK: SELECT STEP TO EDIT BELOW";
-  if (GetMousePosition().y < HEADER_HEIGHT) hint = "CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
   Vector2 mouse = GetMousePosition();
+  if (focused_track < 0 && mouse.x >= CHOKE_X && mouse.x < GRID_X && mouse.y >= GRID_Y && mouse.y < GRID_Y + TRACKS_LENGTH * ROW_HEIGHT) {
+    hint = "CHOKE GROUP: TRACKS IN THE SAME GROUP CUT EACH OTHER OFF";
+  }
+  if (mouse_over_grid()) hint = "CLICK/DRAG: PAINT STEPS  CMD+CLICK: SELECT STEP TO EDIT BELOW";
+  if (mouse.y < HEADER_HEIGHT) hint = "CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
   if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= WINDOW_WIDTH - MARGIN - 165) {
     hint = "MOVE EVERY TRACK ONE OF ITS OWN STEPS, WRAPPING AROUND THE BAR";
   }
@@ -1332,16 +1378,6 @@ pattern_button_bounds (unsigned int index) {
   return (Rectangle){MARGIN + index * PATTERN_BUTTON_STEP, PATTERN_Y, PATTERN_BUTTON_WIDTH, CELL_HEIGHT};
 }
 
-bool
-clicked (Rectangle bounds) {
-  return !GuiIsLocked() && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), bounds);
-}
-
-bool
-shift_down (void) {
-  return IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-}
-
 // Bars are CHAIN_BAR_WIDTH wide until the whole chain would overflow the grid width.
 float
 chain_bar_width (void) {
@@ -1349,12 +1385,6 @@ chain_bar_width (void) {
   for (unsigned int i = 0; i < chain_length; i++) bars += chain[i].repeats;
   float fit = (float) GRID_WIDTH / bars;
   return fit < CHAIN_BAR_WIDTH ? fit : CHAIN_BAR_WIDTH;
-}
-
-void
-draw_centered_text (const char *text, Rectangle bounds, Color color) {
-  int width = MeasureText(text, 10);
-  DrawText(text, bounds.x + (bounds.width - width) / 2, bounds.y + (bounds.height - 10) / 2, 10, color);
 }
 
 // Pattern buttons: click switches (queued until the bar ends while playing),
@@ -1513,6 +1543,7 @@ render_tracks (void) {
   DrawText(focused_track >= 0 ? "VOICE" : "NO", MARGIN, LABELS_Y, 10, MUTED);
   DrawText(show_note_column() ? "NOTE" : "CH", 90, LABELS_Y, 10, MUTED);
   DrawText("STEPS", 200, LABELS_Y, 10, MUTED);
+  if (focused_track < 0) DrawText("CHK", CHOKE_X, LABELS_Y, 10, MUTED);
   for (int k = 0; k < beats_per_loop; k++) {
     DrawText(TextFormat("%d", k + 1), GRID_X + k * GRID_WIDTH / beats_per_loop, LABELS_Y, 10, MUTED);
   }
