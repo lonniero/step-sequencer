@@ -189,6 +189,7 @@ bool copy_mode = false; // next pattern click copies the current pattern there
 unsigned int chain_position = 0;
 unsigned int chain_bar = 0;     // bars already played of the current chain entry
 bool chain_restart = false;     // start the chain from the top at the next loop boundary
+bool chain_visible = true;      // hiding the chain only hides its controls; a running chain keeps playing
 
 typedef struct Scale {
   const char *name;
@@ -1104,6 +1105,7 @@ write_project (const char *path) {
   fprintf(file, "metronome %d\n", metronome_on);
   fprintf(file, "current_pattern %d\n", current_pattern);
   fprintf(file, "chain_mode %d\n", chain_mode);
+  fprintf(file, "chain_visible %d\n", chain_visible);
   if (project_path[0]) fprintf(file, "project_path %s\n", project_path);
   if (dropdown_active > 0) fprintf(file, "output %s\n", midi_output_devices[dropdown_active - 1].name);
   if (clock_input_name[0]) fprintf(file, "clock_input %s\n", clock_input_name);
@@ -1274,6 +1276,8 @@ read_project (const char *path, bool restore_session) {
       if (n >= MIN_SWING && n <= MAX_SWING) swing = n;
     } else if (sscanf(line, "current_pattern %u", &a) == 1) {
       if (a < PATTERNS_LENGTH) current_pattern = a;
+    } else if (sscanf(line, "chain_visible %u", &a) == 1) {
+      chain_visible = a;
     } else if (sscanf(line, "chain_mode %u", &a) == 1) {
       chain_mode = a;
     } else if (sscanf(line, "track_scale %u %u %u %u", &a, &b, &c, &d) == 4) {
@@ -1525,6 +1529,10 @@ render_toolbar (void) {
   unsigned int count = focused_track >= 0 ? VOICES_PER_TRACK : VOICES_LENGTH;
   if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 165, TOOLBAR2_Y, 80, CELL_HEIGHT}, "< SHIFT")) rotate_voices(first, count, -1);
   if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 80, TOOLBAR2_Y, 80, CELL_HEIGHT}, "SHIFT >")) rotate_voices(first, count, 1);
+
+  if (GuiButton((Rectangle){WINDOW_WIDTH - MARGIN - 250, TOOLBAR2_Y, 80, CELL_HEIGHT}, chain_visible ? "HIDE CHAIN" : "SHOW CHAIN")) {
+    chain_visible = !chain_visible;
+  }
 }
 
 // Row number: click mutes, cmd-click solos, opt-click opens (main view) or closes (focus view) focus.
@@ -1744,14 +1752,20 @@ render_step (void) {
   if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= 210 && mouse.x < 290) {
     hint = "METRONOME: A BUILT-IN CLICK, NOT SENT OVER MIDI";
   }
+  if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= WINDOW_WIDTH - MARGIN - 250 && mouse.x < WINDOW_WIDTH - MARGIN - 170) {
+    hint = "SHOW OR HIDE THE CHAIN; A PLAYING CHAIN KEEPS PLAYING";
+  }
   if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= WINDOW_WIDTH - MARGIN - 165) {
     hint = "MOVE EVERY TRACK ONE OF ITS OWN STEPS, WRAPPING AROUND THE BAR";
   }
   if (mouse.y >= PATTERN_Y && mouse.y < PATTERN_Y + CELL_HEIGHT) {
-    if (mouse.x < COPY_BUTTON_X) hint = "CLICK: SWITCH  SHIFT+CLICK: ADD TO CHAIN  OPT+CLICK: COPY CURRENT HERE";
-    else if (mouse.x < CHAIN_BUTTON_X) hint = "COPY, THEN CLICK THE PATTERN TO COPY INTO";
-    else if (mouse.x < GRID_X) hint = "CLICK: PLAY THE CHAIN INSTEAD OF ONE PATTERN";
-    else hint = "CLICK: +1 BAR  SHIFT+CLICK: -1 BAR  OPT+CLICK: REMOVE";
+    if (mouse.x < COPY_BUTTON_X) {
+      hint = chain_visible ? "CLICK: SWITCH  SHIFT+CLICK: ADD TO CHAIN  OPT+CLICK: COPY CURRENT HERE" : "CLICK: SWITCH  OPT+CLICK: COPY CURRENT HERE";
+    } else if (mouse.x < CHAIN_BUTTON_X) {
+      hint = "COPY, THEN CLICK THE PATTERN TO COPY INTO";
+    } else if (chain_visible) {
+      hint = mouse.x < GRID_X ? "CLICK: PLAY THE CHAIN INSTEAD OF ONE PATTERN" : "CLICK: +1 BAR  SHIFT+CLICK: -1 BAR  OPT+CLICK: REMOVE";
+    }
   }
   if (focused_track >= 0 && mouse.y >= PITCH_Y && mouse.y < PITCH_Y + CELL_HEIGHT) {
     if (mouse.x < 90) hint = "ON: NOTE EDITS STAY IN THE SCALE AND STEPS PLAY QUANTIZED";
@@ -1786,7 +1800,7 @@ render_pattern_buttons (void) {
     Rectangle bounds = pattern_button_bounds(i);
     if (clicked(bounds)) {
       if (shift_down()) {
-        append_to_chain(i);
+        if (chain_visible) append_to_chain(i);
       } else if ((copy_mode || option_down()) && (int) i != current_pattern) {
         // Copy, then move to the copy so edits leave the original untouched.
         unsigned int source = current_pattern;
@@ -1817,6 +1831,7 @@ render_pattern_buttons (void) {
   DrawRectangleLinesEx(copy_button, 1, INK);
   draw_centered_text("COPY", copy_button, INK);
 
+  if (!chain_visible) return;
   Rectangle chain_button = {CHAIN_BUTTON_X, PATTERN_Y, STRIP_BUTTON_WIDTH, CELL_HEIGHT};
   if (clicked(chain_button)) toggle_chain_mode();
   DrawRectangleRec(chain_button, chain_mode ? ACCENT : background_color());
@@ -1875,10 +1890,10 @@ render_chain (void) {
 void
 render_patterns (void) {
   DrawText("PATTERN", MARGIN, PATTERN_LABELS_Y, 10, MUTED);
-  DrawText("CHAIN", GRID_X, PATTERN_LABELS_Y, 10, MUTED);
+  if (chain_visible) DrawText("CHAIN", GRID_X, PATTERN_LABELS_Y, 10, MUTED);
   DrawRectangle(MARGIN, PATTERN_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, rule_color());
   render_pattern_buttons();
-  render_chain();
+  if (chain_visible) render_chain();
 }
 
 // A value between arrow buttons, laid out like a spinner. Returns -1, 0 or 1.
