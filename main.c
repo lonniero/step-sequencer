@@ -1002,6 +1002,42 @@ render_voice_lanes (unsigned int track, float y) {
   }
 }
 
+// Click-drag paints steps: the first cell pressed decides whether the drag turns steps on or off.
+int paint_value = -1; // -1 while not painting
+Vector2 previous_mouse;
+
+// Samples the mouse path since the last frame, so fast drags do not skip cells.
+bool
+mouse_path_hits (Rectangle bounds) {
+  Vector2 mouse = GetMousePosition();
+  float dx = mouse.x - previous_mouse.x, dy = mouse.y - previous_mouse.y;
+  int samples = 1 + sqrtf(dx * dx + dy * dy) / 4;
+  for (int i = 0; i <= samples; i++) {
+    Vector2 point = {previous_mouse.x + dx * i / samples, previous_mouse.y + dy * i / samples};
+    if (CheckCollisionPointRec(point, bounds)) return true;
+  }
+  return false;
+}
+
+void
+paint_cell (Voice *voice, unsigned int step, Rectangle cell) {
+  if (GuiIsLocked()) return;
+  uint64_t bit = (uint64_t) 1 << step;
+  if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(GetMousePosition(), cell)) {
+    selected_step = voice->id * MAX_STEPS + step;
+    if (command_down()) return; // cmd-click selects without toggling
+    paint_value = !(voice->sequence & bit);
+  }
+  if (paint_value < 0 || !IsMouseButtonDown(MOUSE_BUTTON_LEFT) || !mouse_path_hits(cell)) return;
+  voice->sequence = paint_value ? voice->sequence | bit : voice->sequence & ~bit;
+}
+
+void
+end_paint_frame (void) {
+  if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) paint_value = -1;
+  previous_mouse = GetMousePosition();
+}
+
 unsigned int
 extra_voices_in_use (unsigned int track) {
   unsigned int count = 0;
@@ -1057,11 +1093,10 @@ render_row (Voice *voice, unsigned int row) {
     int x1 = GRID_X + ((j + 1) * GRID_WIDTH) / voice->steps;
     Rectangle cell = {x0, y, x1 - x0 - GRID_GAP, CELL_HEIGHT};
 
+    paint_cell(voice, j, cell);
     bool on = bit_by_position(voice->sequence, j);
-    if (GuiToggle(cell, NULL, &on)) {
-      if (!command_down()) voice->sequence ^= (uint64_t) 1 << j; // cmd-click selects without toggling
-      selected_step = (voice->id * MAX_STEPS) + j;
-    }
+    bool drawn = on;
+    GuiToggle(cell, NULL, &drawn); // draws the cell only, paint_cell handles the clicks
 
     // In focus view active steps are accent, so the playhead and selection use ink instead.
     Color mark = in_focus() ? INK : ACCENT;
@@ -1104,7 +1139,7 @@ render_step (void) {
 
   const char *hint = focused_track >= 0 ? "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: CLOSE  HOLD CMD: CH"
                                         : "CLICK NO: MUTE  CMD+CLICK: SOLO  OPT+CLICK: FOCUS  HOLD CMD: NOTE";
-  if (mouse_over_grid()) hint = "CLICK: TOGGLE STEP  CMD+CLICK: SELECT STEP TO EDIT BELOW";
+  if (mouse_over_grid()) hint = "CLICK/DRAG: PAINT STEPS  CMD+CLICK: SELECT STEP TO EDIT BELOW";
   if (GetMousePosition().y < HEADER_HEIGHT) hint = "CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
   Vector2 mouse = GetMousePosition();
   if (mouse.y >= PATTERN_Y && mouse.y < PATTERN_Y + CELL_HEIGHT) {
@@ -1332,6 +1367,7 @@ main (void) {
     render_step();
     GuiUnlock();
     render_dropdown();
+    end_paint_frame();
 
     pthread_mutex_unlock(&lock);
 
