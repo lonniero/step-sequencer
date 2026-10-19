@@ -59,7 +59,8 @@
 #define PITCH_HEIGHT  62
 #define PATTERN_LABELS_Y (526 + pitch_height())
 #define PATTERN_Y     (548 + pitch_height())
-#define FOOTER_Y      (588 + pitch_height())
+#define PATTERN_HEIGHT 62
+#define FOOTER_Y      (588 + pitch_height() - (chain_visible ? 0 : PATTERN_HEIGHT))
 
 #define PATTERN_BUTTON_WIDTH 23
 #define PATTERN_BUTTON_STEP  26
@@ -168,14 +169,10 @@ int selected_step = 0;
 int focused_track = -1; // -1 shows all tracks, otherwise the voices of this track
 
 // The pitch section only shows in focus view, pushing the patterns and footer down.
+// The window fits whichever sections are showing.
 int
 pitch_height (void) {
   return focused_track >= 0 ? PITCH_HEIGHT : 0;
-}
-
-int
-window_height (void) {
-  return WINDOW_HEIGHT + pitch_height();
 }
 
 // All guarded by lock: tick switches patterns at the loop boundary.
@@ -189,7 +186,12 @@ bool copy_mode = false; // next pattern click copies the current pattern there
 unsigned int chain_position = 0;
 unsigned int chain_bar = 0;     // bars already played of the current chain entry
 bool chain_restart = false;     // start the chain from the top at the next loop boundary
-bool chain_visible = true;      // hiding the chain only hides its controls; a running chain keeps playing
+bool chain_visible = true;      // the pattern and chain section; hiding it keeps a running chain playing
+
+int
+window_height (void) {
+  return WINDOW_HEIGHT + pitch_height() - (chain_visible ? 0 : PATTERN_HEIGHT);
+}
 
 typedef struct Scale {
   const char *name;
@@ -1753,19 +1755,16 @@ render_step (void) {
     hint = "METRONOME: A BUILT-IN CLICK, NOT SENT OVER MIDI";
   }
   if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= WINDOW_WIDTH - MARGIN - 250 && mouse.x < WINDOW_WIDTH - MARGIN - 170) {
-    hint = "SHOW OR HIDE THE CHAIN; A PLAYING CHAIN KEEPS PLAYING";
+    hint = "SHOW OR HIDE THE PATTERN AND CHAIN ROW; A PLAYING CHAIN KEEPS PLAYING";
   }
   if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= WINDOW_WIDTH - MARGIN - 165) {
     hint = "MOVE EVERY TRACK ONE OF ITS OWN STEPS, WRAPPING AROUND THE BAR";
   }
-  if (mouse.y >= PATTERN_Y && mouse.y < PATTERN_Y + CELL_HEIGHT) {
-    if (mouse.x < COPY_BUTTON_X) {
-      hint = chain_visible ? "CLICK: SWITCH  SHIFT+CLICK: ADD TO CHAIN  OPT+CLICK: COPY CURRENT HERE" : "CLICK: SWITCH  OPT+CLICK: COPY CURRENT HERE";
-    } else if (mouse.x < CHAIN_BUTTON_X) {
-      hint = "COPY, THEN CLICK THE PATTERN TO COPY INTO";
-    } else if (chain_visible) {
-      hint = mouse.x < GRID_X ? "CLICK: PLAY THE CHAIN INSTEAD OF ONE PATTERN" : "CLICK: +1 BAR  SHIFT+CLICK: -1 BAR  OPT+CLICK: REMOVE";
-    }
+  if (chain_visible && mouse.y >= PATTERN_Y && mouse.y < PATTERN_Y + CELL_HEIGHT) {
+    if (mouse.x < COPY_BUTTON_X) hint = "CLICK: SWITCH  SHIFT+CLICK: ADD TO CHAIN  OPT+CLICK: COPY CURRENT HERE";
+    else if (mouse.x < CHAIN_BUTTON_X) hint = "COPY, THEN CLICK THE PATTERN TO COPY INTO";
+    else if (mouse.x < GRID_X) hint = "CLICK: PLAY THE CHAIN INSTEAD OF ONE PATTERN";
+    else hint = "CLICK: +1 BAR  SHIFT+CLICK: -1 BAR  OPT+CLICK: REMOVE";
   }
   if (focused_track >= 0 && mouse.y >= PITCH_Y && mouse.y < PITCH_Y + CELL_HEIGHT) {
     if (mouse.x < 90) hint = "ON: NOTE EDITS STAY IN THE SCALE AND STEPS PLAY QUANTIZED";
@@ -1800,7 +1799,7 @@ render_pattern_buttons (void) {
     Rectangle bounds = pattern_button_bounds(i);
     if (clicked(bounds)) {
       if (shift_down()) {
-        if (chain_visible) append_to_chain(i);
+        append_to_chain(i);
       } else if ((copy_mode || option_down()) && (int) i != current_pattern) {
         // Copy, then move to the copy so edits leave the original untouched.
         unsigned int source = current_pattern;
@@ -1831,7 +1830,6 @@ render_pattern_buttons (void) {
   DrawRectangleLinesEx(copy_button, 1, INK);
   draw_centered_text("COPY", copy_button, INK);
 
-  if (!chain_visible) return;
   Rectangle chain_button = {CHAIN_BUTTON_X, PATTERN_Y, STRIP_BUTTON_WIDTH, CELL_HEIGHT};
   if (clicked(chain_button)) toggle_chain_mode();
   DrawRectangleRec(chain_button, chain_mode ? ACCENT : background_color());
@@ -1890,10 +1888,10 @@ render_chain (void) {
 void
 render_patterns (void) {
   DrawText("PATTERN", MARGIN, PATTERN_LABELS_Y, 10, MUTED);
-  if (chain_visible) DrawText("CHAIN", GRID_X, PATTERN_LABELS_Y, 10, MUTED);
+  DrawText("CHAIN", GRID_X, PATTERN_LABELS_Y, 10, MUTED);
   DrawRectangle(MARGIN, PATTERN_Y - 8, WINDOW_WIDTH - 2 * MARGIN, 2, rule_color());
   render_pattern_buttons();
-  if (chain_visible) render_chain();
+  render_chain();
 }
 
 // A value between arrow buttons, laid out like a spinner. Returns -1, 0 or 1.
@@ -1978,9 +1976,19 @@ render_footer (void) {
 
 int
 main (void) {
+  Pm_Initialize();
+  init_tracks();
+  init_steps();
+  init_patterns();
+
+  // The session is restored before the window opens, so the window starts at the size its sections need.
+  list_midi_devices();
+  char session[PATH_MAX];
+  autosave_path(session, sizeof session);
+  if (!read_project(session, true)) randomize_voices(0, TRACKS_LENGTH, VOICES_PER_TRACK);
+
   InitWindow(WINDOW_WIDTH, window_height(), "SEQ/08");
   SetTargetFPS(60);
-  Pm_Initialize();
 
   InitAudioDevice();
   SetAudioStreamBufferSizeDefault(CLICK_BUFFER_FRAMES);
@@ -1988,14 +1996,6 @@ main (void) {
   SetAudioStreamCallback(click, render_click);
   PlayAudioStream(click);
 
-  init_tracks();
-  init_steps();
-  init_patterns();
-
-  list_midi_devices();
-  char session[PATH_MAX];
-  autosave_path(session, sizeof session);
-  if (!read_project(session, true)) randomize_voices(0, TRACKS_LENGTH, VOICES_PER_TRACK);
   double next_autosave = GetTime() + AUTOSAVE_SECONDS;
 
   if (Pt_Start(CLOCK_RESOLUTION_MS, tick, NULL) != ptNoError) {
@@ -2034,7 +2034,7 @@ main (void) {
     render_footer();
     if (dropdown_open) GuiLock();
     render_toolbar();
-    render_patterns();
+    if (chain_visible) render_patterns();
     if (focused_track >= 0) render_pitch();
     render_tracks();
     render_step();
