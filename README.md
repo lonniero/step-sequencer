@@ -8,7 +8,12 @@ An 8-track MIDI step sequencer for macOS, written in C with [raylib](https://www
 
 - 8 tracks, each with its own MIDI note and step count (1–32), so tracks of different lengths play polyrhythms
 - BPM control (40–240), one bar of 4 beats per loop
-- Click cells to toggle steps; Randomize and Clear the whole pattern
+- Click or drag across cells to paint steps; Randomize and Clear the whole pattern
+- Shift the pattern left or right one step, wrapping around; each track moves by one of its own steps
+- Swing (50–75%) and a built-in metronome click
+- Per-step detune, velocity and nudge (up to half a step early or late): cmd-click a step to edit it
+- Choke groups A–D: tracks in the same group cut each other off, like open and closed hi-hats
+- Scales: 29 scales from major and minor to Romanian minor, Arabic, Hijaz, Persian and Hirajoshi; transpose and note edits stay in the scale and steps play quantized
 - Choose any MIDI output device from the dropdown
 
 ## Build
