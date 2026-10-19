@@ -1144,6 +1144,31 @@ read_project (const char *path, bool restore_session) {
   return true;
 }
 
+// A blank project: no steps, default tracks, 120 BPM. The MIDI output stays selected.
+void
+new_project (void) {
+  stop();
+  reset_project();
+  bpm = 120;
+  project_path[0] = '\0';
+  set_status("NEW PROJECT");
+}
+
+// NEW wipes everything, so it asks for a second press within NEW_CONFIRM_SECONDS.
+#define NEW_CONFIRM_SECONDS 3
+double new_armed_until = 0;
+
+void
+press_new (void) {
+  if (GetTime() < new_armed_until) {
+    new_armed_until = 0;
+    new_project();
+  } else {
+    new_armed_until = GetTime() + NEW_CONFIRM_SECONDS;
+    set_status("PRESS NEW AGAIN TO CLEAR EVERYTHING");
+  }
+}
+
 void
 autosave (void) {
   char path[PATH_MAX];
@@ -1249,6 +1274,7 @@ render_header (void) {
   }
 
   bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+  if (header_button((Rectangle){WINDOW_WIDTH - MARGIN - 210, 8, 44, 20}, GetTime() < new_armed_until ? "SURE?" : "NEW")) press_new();
   if (header_button((Rectangle){WINDOW_WIDTH - MARGIN - 160, 8, 44, 20}, "OPEN")) pending_file_action = FILE_ACTION_OPEN;
   if (header_button((Rectangle){WINDOW_WIDTH - MARGIN - 110, 8, 44, 20}, shift ? "SAVE AS" : "SAVE")) {
     pending_file_action = shift ? FILE_ACTION_SAVE_AS : FILE_ACTION_SAVE;
@@ -1515,7 +1541,7 @@ render_step (void) {
   }
   if (mouse_over_grid()) hint = "CLICK/DRAG: PAINT STEPS  CMD+CLICK: SELECT STEP TO EDIT BELOW";
   if (mouse.y >= STEP_Y && mouse.y < STEP_Y + CELL_HEIGHT) hint = "LEFT/RIGHT ARROWS NUDGE THE SELECTED STEP";
-  if (mouse.y < HEADER_HEIGHT) hint = "CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
+  if (mouse.y < HEADER_HEIGHT) hint = "CMD+N: NEW  CMD+S: SAVE  SHIFT+CMD+S: SAVE AS  CMD+O: OPEN";
   if (mouse.y >= TOOLBAR2_Y && mouse.y < TOOLBAR2_Y + CELL_HEIGHT && mouse.x >= 210 && mouse.x < 290) {
     hint = "METRONOME: A BUILT-IN CLICK, NOT SENT OVER MIDI";
   }
@@ -1774,6 +1800,7 @@ main (void) {
         pending_file_action = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT) ? FILE_ACTION_SAVE_AS : FILE_ACTION_SAVE;
       }
       if (command_down() && IsKeyPressed(KEY_O)) pending_file_action = FILE_ACTION_OPEN;
+      if (command_down() && IsKeyPressed(KEY_N)) press_new();
     }
     if (GetTime() >= next_autosave) {
       autosave();
